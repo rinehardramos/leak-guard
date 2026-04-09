@@ -63,3 +63,31 @@ id = "date-of-birth"
 description = "Date of birth (contextual)"
 severity = "medium"
 regex = '''(?i)(?:dob|date[_\s-]?of[_\s-]?birth|birthday|born)[^\n]{0,10}\b(?:\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}-\d{2}-\d{2})\b'''
+
+[[rule]]
+id = "assigned-password"
+description = "Password in assignment context"
+severity = "high"
+# Matches: password=foo, password: foo, password "foo", --password foo (not 'password' alone)
+regex = '''(?i)(?:^|[\s,;|&])(?:password|passwd|pass|pwd)[\s]*(?:=|:(?!=)|is\s|")\s*(?!["'\s]{0,2}(?:$|\n))["']?([^\s"',;]{6,})'''
+
+[[rule]]
+id = "assigned-token"
+description = "Token/bearer credential in assignment context"
+severity = "high"
+# Matches: token=xxx, bearer xxx, access_token: xxx
+regex = '''(?i)(?:^|[\s,;])(?:(?:access[_-]?|refresh[_-]?|auth[_-]?|api[_-]?|bearer[_-]?)?token|bearer)[\s]*(?:=|:(?!=)|"|\s)\s*(?!["'\s]{0,2}(?:$|\n))["']?([A-Za-z0-9+/._~-]{16,})'''
+
+[[rule]]
+id = "assigned-api-key"
+description = "API key in assignment context"
+severity = "high"
+# Matches: api_key=xxx, apikey: xxx, x-api-key: xxx
+regex = '''(?i)(?:^|[\s,;])(?:api[_-]?key|apikey|x-api-key|app[_-]?key|app[_-]?secret|client[_-]?secret|consumer[_-]?secret)[\s]*(?:=|:(?!=))\s*["']?([A-Za-z0-9+/._~-]{16,})["']?'''
+
+[[rule]]
+id = "assigned-secret"
+description = "Generic secret/credential in assignment context"
+severity = "high"
+# Matches: secret=xxx, my_secret: xxx — but NOT 'secret' as a standalone word
+regex = '''(?i)(?:^|[\s,;])(?:secret|credential|private[_-]?key|signing[_-]?key|encryption[_-]?key)[\s]*(?:=|:(?!=))\s*["']?([A-Za-z0-9+/._~-]{16,})["']?'''

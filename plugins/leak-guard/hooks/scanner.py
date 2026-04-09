@@ -22,6 +22,7 @@ import argparse
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -258,6 +259,81 @@ def scan_pii_text(text: str, rules: list[PiiRule], allow: Allowlist,
     return findings
 
 
+def _shannon_entropy(s: str) -> float:
+    """Bits-per-character Shannon entropy."""
+    if not s:
+        return 0.0
+    counts: dict[str, int] = {}
+    for c in s:
+        counts[c] = counts.get(c, 0) + 1
+    n = len(s)
+    return -sum((v / n) * math.log2(v / n) for v in counts.values())
+
+
+# Charset patterns for high-entropy token candidates.
+# base64url: A-Za-z0-9+/=_ and - (covers bearer tokens, JWT segments, API keys)
+# hex: 0-9a-f (covers commit hashes, UUIDs stripped of dashes, raw keys)
+_B64_RE = re.compile(r'[A-Za-z0-9+/=_~-]{20,}')
+_HEX_RE = re.compile(r'\b[0-9a-fA-F]{32,}\b')
+
+# Entropy thresholds (bits/char). Tuned to catch real tokens while avoiding
+# English prose (entropy ~3.5) and short random words.
+_B64_ENTROPY_MIN = 4.5   # base64 random data: ~5.8 bits/char
+_HEX_ENTROPY_MIN = 3.5   # hex random data: ~3.9 bits/char; lowercase words: ~3.2
+
+# Skip strings that look like common non-secret base64 (e.g. long URLs, UUIDs).
+_URL_RE = re.compile(r'https?://', re.I)
+
+# Context keywords adjacent to the candidate that strongly suggest a secret.
+# We use these to *lower* the entropy threshold when present.
+_SECRET_CONTEXT_RE = re.compile(
+    r'(?i)(?:secret|token|password|passwd|api[_\s-]?key|auth|bearer|credential|private[_\s-]?key)',
+)
+
+
+def scan_entropy(text: str, allow: Allowlist, source: str = "") -> list[Finding]:
+    """Detect standalone high-entropy strings that look like tokens or keys."""
+    if not text:
+        return []
+    findings: list[Finding] = []
+    seen: set[str] = set()
+
+    def _check(m: re.Match, charset: str, threshold: float) -> None:
+        candidate = m.group(0)
+        if candidate in seen or candidate in allow.literal:
+            return
+        # Skip plain URLs
+        start = max(0, m.start() - 8)
+        prefix = text[start:m.start()]
+        if _URL_RE.search(prefix):
+            return
+        ent = _shannon_entropy(candidate)
+        # Lower threshold when a secret-like keyword appears within 60 chars
+        ctx_window = text[max(0, m.start() - 60):m.end() + 60]
+        effective_threshold = threshold - 0.5 if _SECRET_CONTEXT_RE.search(ctx_window) else threshold
+        if ent < effective_threshold:
+            return
+        seen.add(candidate)
+        upto = text[:m.start()]
+        line_no = upto.count("\n") + 1
+        findings.append(Finding(
+            rule_id=f"high-entropy-{charset}",
+            category="pii",
+            description=f"High-entropy {charset} string (entropy={ent:.2f} bits/char) — possible token/key",
+            line=line_no,
+            preview=redact_preview(candidate, f"entropy-{charset}"),
+            severity="high",
+            source=source,
+        ))
+
+    for m in _B64_RE.finditer(text):
+        _check(m, "base64", _B64_ENTROPY_MIN)
+    for m in _HEX_RE.finditer(text):
+        _check(m, "hex", _HEX_ENTROPY_MIN)
+
+    return findings
+
+
 def scan_secrets_gitleaks(text: str | None = None, path: str | None = None,
                           source_label: str = "") -> list[Finding]:
     """Run gitleaks in no-git mode. Returns findings.
@@ -372,10 +448,12 @@ def scan_all(text: str | None = None, path: str | None = None,
     # 3. PII via regex
     if text is not None:
         findings.extend(scan_pii_text(text, pii_rules, allow, source=source_label))
+        findings.extend(scan_entropy(text, allow, source=source_label))
     elif path is not None and Path(path).is_file():
         try:
             content = Path(path).read_text(errors="replace")
             findings.extend(scan_pii_text(content, pii_rules, allow, source=path))
+            findings.extend(scan_entropy(content, allow, source=path))
         except Exception:
             pass
 
@@ -432,25 +510,66 @@ def emit_prompt_block(reason: str) -> None:
     sys.stdout.flush()
 
 
+# Prefix the user can prepend to bypass heuristic (non-gitleaks) findings for one submission.
+_ALLOW_ONCE_PREFIX = "[allow-once]"
+
+# Rule IDs produced by heuristics rather than gitleaks — eligible for the ask flow.
+_HEURISTIC_RULE_IDS = {"high-entropy-base64", "high-entropy-hex",
+                        "assigned-password", "assigned-token",
+                        "assigned-api-key", "assigned-secret"}
+
+
+def _ask_message(findings: list[Finding]) -> str:
+    summary = format_summary(findings)
+    return (
+        "leak-guard: suspicious pattern detected — possible credential or token.\n"
+        f"{summary}\n\n"
+        "Choose an action and resubmit:\n"
+        "  1. Redact  — remove or replace the value in your message (e.g. <REDACTED>)\n"
+        "  2. Remove  — delete the sensitive part entirely before sending\n"
+        f"  3. Allow once — prepend '{_ALLOW_ONCE_PREFIX}' to your message to send as-is this one time\n"
+        "  4. Allow always — add the value to ~/.claude/leak-guard/allowlist.toml"
+    )
+
+
 def hook_user_prompt() -> int:
     event = read_event()
     prompt = event.get("prompt", "") or ""
+
+    # Strip allow-once prefix → pass through heuristic checks for this submission only.
+    if prompt.lstrip().startswith(_ALLOW_ONCE_PREFIX):
+        audit("allow_once_bypass", {})
+        return 0  # let the prompt through unchanged
+
     findings = scan_all(text=prompt, source_label="<user-prompt>")
     secrets, pii = classify(findings)
-    if secrets:
-        audit("block_user_prompt_secret", {"count": len(secrets)})
+
+    # Partition heuristic vs. high-confidence findings.
+    definitive_secrets = [f for f in secrets if f.rule_id not in _HEURISTIC_RULE_IDS]
+    heuristic_findings = [f for f in secrets + pii if f.rule_id in _HEURISTIC_RULE_IDS]
+    definitive_pii = [f for f in pii if f.rule_id not in _HEURISTIC_RULE_IDS]
+
+    if definitive_secrets:
+        audit("block_user_prompt_secret", {"count": len(definitive_secrets)})
         emit_prompt_block(
             "leak-guard: secrets detected in your prompt. Please remove them before submitting.\n"
-            + format_summary(secrets)
+            + format_summary(definitive_secrets)
         )
         return 0
-    if pii:
-        audit("block_user_prompt_pii", {"count": len(pii)})
+
+    if heuristic_findings:
+        audit("ask_user_prompt_heuristic", {"count": len(heuristic_findings)})
+        emit_prompt_block(_ask_message(heuristic_findings))
+        return 0
+
+    if definitive_pii:
+        audit("block_user_prompt_pii", {"count": len(definitive_pii)})
         emit_prompt_block(
             "leak-guard: PII detected in your prompt. Rephrase, redact, or add to allowlist "
-            f"(~/.claude/leak-guard/allowlist.toml).\n{format_summary(pii)}"
+            f"(~/.claude/leak-guard/allowlist.toml).\n{format_summary(definitive_pii)}"
         )
         return 0
+
     return 0
 
 
