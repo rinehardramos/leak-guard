@@ -1115,6 +1115,144 @@ def _action_picker(findings: list, prompt: str, silent: bool) -> tuple:
             pass
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Prompt-injected action picker (Turn 1: block + write pending; Turn 2: handle choice)
+# ──────────────────────────────────────────────────────────────────────────
+
+# Pending action file — stores the original prompt + redact targets temporarily
+# so the user can reply with A/R/D/F in the next turn.
+# Security note: raw_match values are stored here temporarily (mode 0o600),
+# same security posture as ssh-agent temp files. Auto-deleted after use or TTL.
+PENDING_ACTION = STATE_DIR / "pending_action.json"
+
+_PENDING_TTL = 300  # 5 minutes
+
+
+def _write_pending_action(prompt: str, findings: list) -> None:
+    """Write pending_action.json with mode 0o600. findings is a list of Finding objects."""
+    try:
+        ensure_state_dir()
+        data = {
+            "prompt": prompt,
+            "redact_targets": [f.raw_match for f in findings if f.raw_match],
+            "findings_summary": [
+                {"rule_id": f.rule_id, "severity": f.severity, "preview": f.preview}
+                for f in findings
+            ],
+            "expires_at": time.time() + _PENDING_TTL,
+        }
+        # Write with restricted permissions
+        fd = os.open(str(PENDING_ACTION), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+    except Exception:
+        pass  # fail open: if we can't write, fall through to normal scan next turn
+
+
+def _read_pending_action() -> dict | None:
+    """Read and return pending action, or None if missing/expired."""
+    try:
+        if not PENDING_ACTION.exists():
+            return None
+        data = json.loads(PENDING_ACTION.read_text(encoding="utf-8"))
+        if time.time() > data.get("expires_at", 0):
+            try:
+                PENDING_ACTION.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _is_choice_reply(prompt: str) -> str | None:
+    """Return normalised choice ('A','R','D','F') if prompt is a reply to the action picker.
+
+    Returns None if no pending_action.json exists — avoids intercepting
+    genuine one-letter prompts when there's nothing pending.
+    """
+    # Check pending file first to avoid intercepting genuine one-letter prompts
+    try:
+        if not PENDING_ACTION.exists():
+            return None
+    except Exception:
+        return None
+
+    stripped = prompt.strip().lower()
+    if stripped in {"a", "r", "d", "f"}:
+        return stripped.upper()
+    if stripped.startswith("allow"):
+        return "A"
+    if stripped.startswith("redact"):
+        return "R"
+    if stripped.startswith("discard") or stripped.startswith("delete"):
+        return "D"
+    if stripped.startswith("flag"):
+        return "F"
+    return None
+
+
+def _handle_choice(choice: str, pending: dict) -> int:
+    """Execute the user's choice from the action picker menu.
+
+    Always deletes PENDING_ACTION first, then acts on the choice.
+    """
+    try:
+        PENDING_ACTION.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    original_prompt = pending.get("prompt", "")
+    redact_targets = pending.get("redact_targets", [])
+
+    if choice == "A":
+        emit_allow_modified(original_prompt)
+        return 0
+
+    elif choice == "R":
+        redacted = original_prompt
+        for target in redact_targets:
+            if target:
+                redacted = redacted.replace(target, "[REDACTED]")
+        emit_allow_modified(redacted)
+        return 0
+
+    elif choice == "F":
+        for target in redact_targets:
+            if target:
+                try:
+                    subprocess.run(
+                        [sys.executable, __file__, "flag", "fp",
+                         "--literal", target,
+                         "--reason", "user marked FP via action picker"],
+                        capture_output=True,
+                        timeout=10,
+                    )
+                except Exception:
+                    pass
+        emit_allow_modified(original_prompt)
+        return 0
+
+    else:  # D or anything else
+        emit_prompt_block("Discarded by user choice.")
+        return 2
+
+
+def _build_menu_text(findings: list) -> str:
+    """Build the action picker menu text displayed to the user via Claude's UI."""
+    lines = ["\U0001f6a8 leak-guard: suspicious content detected in your prompt.\n"]
+    for f in findings:
+        lines.append(f"  \u00b7 {f.rule_id} ({f.severity}) \u2014 {f.preview}")
+    lines.append("\n  Reply with your choice:")
+    lines.append("    A \u2014 Allow once (send original prompt as-is)")
+    lines.append("    R \u2014 Redact (strip flagged content, send cleaned prompt)")
+    lines.append("    D \u2014 Discard (cancel \u2014 default if no reply within 5 min)")
+    lines.append("    F \u2014 Flag as false positive (allowlist + send)")
+    lines.append("\n  Choice [A/R/D/F]:")
+    return "\n".join(lines)
+
+
 # Prefix the user can prepend to bypass heuristic (non-gitleaks) findings for one submission.
 _ALLOW_ONCE_PREFIX = "[allow-once]"
 
@@ -1140,6 +1278,15 @@ def _ask_message(findings: list[Finding]) -> str:
 def hook_user_prompt() -> int:
     event = read_event()
     prompt = event.get("prompt", "") or ""
+
+    # ── Turn 2: check if this is a reply to the action picker menu ────────────
+    choice = _is_choice_reply(prompt)
+    if choice is not None:
+        pending = _read_pending_action()
+        if pending is not None:
+            return _handle_choice(choice, pending)
+        # No valid pending action — fall through to normal scan
+
     allow_once = prompt.lstrip().startswith(_ALLOW_ONCE_PREFIX)
 
     allow = load_allowlist()
@@ -1157,24 +1304,11 @@ def hook_user_prompt() -> int:
         audit("block_user_prompt_secret", {"count": len(definitive_secrets)})
         top_rule = definitive_secrets[0].rule_id
         top_cat = definitive_secrets[0].category
-        notice = _maybe_emit_verifier_notice(top_rule, top_cat)
-        reason = (
-            "leak-guard: secrets detected in your prompt. Please remove them before submitting.\n"
-            + format_summary(definitive_secrets)
-        )
-        if notice:
-            reason += "\n" + notice
-        rc, updated = _action_picker(definitive_secrets, prompt, silent)
-        if rc == 0 and updated is not None:
-            audit("allow_redacted_user_prompt", {"rules": [f.rule_id for f in definitive_secrets]})
-            emit_allow_modified(updated)
-            return 0
-        elif rc == 0:
-            audit("allow_once_user_prompt", {"rules": [f.rule_id for f in definitive_secrets]})
-            return 0
-        else:
-            emit_prompt_block(reason, silent=silent)
-            return 2
+        _maybe_emit_verifier_notice(top_rule, top_cat)
+        _write_pending_action(prompt, definitive_secrets)
+        menu = _build_menu_text(definitive_secrets)
+        emit_prompt_block(menu, silent=silent)
+        return 2
 
     # [allow-once] prefix: skip heuristic findings only (no definitive secrets above).
     if allow_once:
@@ -1185,40 +1319,18 @@ def hook_user_prompt() -> int:
         audit("ask_user_prompt_heuristic", {"count": len(heuristic_findings)})
         top_rule = heuristic_findings[0].rule_id
         top_cat = heuristic_findings[0].category
-        notice = _maybe_emit_verifier_notice(top_rule, top_cat)
-        msg = _ask_message(heuristic_findings)
-        if notice:
-            msg += "\n" + notice
-        rc, updated = _action_picker(heuristic_findings, prompt, silent)
-        if rc == 0 and updated is not None:
-            audit("allow_redacted_user_prompt", {"rules": [f.rule_id for f in heuristic_findings]})
-            emit_allow_modified(updated)
-            return 0
-        elif rc == 0:
-            audit("allow_once_user_prompt", {"rules": [f.rule_id for f in heuristic_findings]})
-            return 0
-        else:
-            emit_prompt_block(msg, silent=silent)
-            return 2
+        _maybe_emit_verifier_notice(top_rule, top_cat)
+        _write_pending_action(prompt, heuristic_findings)
+        menu = _build_menu_text(heuristic_findings)
+        emit_prompt_block(menu, silent=silent)
+        return 2
 
     if definitive_pii:
         audit("block_user_prompt_pii", {"count": len(definitive_pii)})
-        # PII rules are skipped by verifier (pattern-based, no useful synthetic)
-        pii_reason = (
-            "leak-guard: PII detected in your prompt. Rephrase, redact, or add to allowlist "
-            f"(~/.claude/leak-guard/allowlist.toml).\n{format_summary(definitive_pii)}"
-        )
-        rc, updated = _action_picker(definitive_pii, prompt, silent)
-        if rc == 0 and updated is not None:
-            audit("allow_redacted_user_prompt", {"rules": [f.rule_id for f in definitive_pii]})
-            emit_allow_modified(updated)
-            return 0
-        elif rc == 0:
-            audit("allow_once_user_prompt", {"rules": [f.rule_id for f in definitive_pii]})
-            return 0
-        else:
-            emit_prompt_block(pii_reason, silent=silent)
-            return 2
+        _write_pending_action(prompt, definitive_pii)
+        menu = _build_menu_text(definitive_pii)
+        emit_prompt_block(menu, silent=silent)
+        return 2
 
     return 0
 

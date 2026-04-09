@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
@@ -626,138 +628,143 @@ class TestSelftest:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Action picker tests
+# Prompt-injected action picker tests
 # ─────────────────────────────────────────────────────────────────────────────
 
-original_open = open
+@pytest.fixture(autouse=False)
+def isolated_state_dir(monkeypatch, tmp_path):
+    """Redirect STATE_DIR and all derived paths to a temp directory."""
+    state = tmp_path / "leak-guard-state"
+    state.mkdir(mode=0o700)
+    monkeypatch.setenv("LEAK_GUARD_STATE_DIR", str(state))
+    # Patch module-level constants so the in-process scanner uses the temp dir
+    monkeypatch.setattr(sc, "STATE_DIR", state)
+    monkeypatch.setattr(sc, "AUDIT_LOG", state / "audit.log")
+    monkeypatch.setattr(sc, "USER_ALLOWLIST", state / "allowlist.toml")
+    monkeypatch.setattr(sc, "PENDING_ACTION", state / "pending_action.json")
+    return state
 
 
-class _FakeTty:
-    """Write-only sink for the menu display, read-only source for user input."""
-
-    def __init__(self, choice: str):
-        self._reader = io.StringIO(choice + "\n")
-
-    def write(self, s: str) -> int:
-        return len(s)
-
-    def flush(self) -> None:
-        pass
-
-    def read(self, n: int = -1) -> str:
-        return self._reader.read(n)
-
-    def readline(self) -> str:
-        return self._reader.readline()
-
-    def close(self) -> None:
-        pass
+def _make_pending(state_dir: Path, prompt: str, redact_targets: list,
+                  expires_delta: float = 300) -> None:
+    """Write a synthetic pending_action.json into state_dir."""
+    data = {
+        "prompt": prompt,
+        "redact_targets": redact_targets,
+        "findings_summary": [{"rule_id": "test-rule", "severity": "high", "preview": "[R]"}],
+        "expires_at": time.time() + expires_delta,
+    }
+    p = state_dir / "pending_action.json"
+    fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(data, fh)
 
 
-@contextmanager
-def mock_tty(choice: str):
-    """Simulate user typing a single character in the action picker."""
-    fake = _FakeTty(choice)
-    with patch.object(sc, "_open_tty", return_value=fake):
-        yield
+def _run_hook_with_state(state_dir: Path, prompt: str) -> tuple[int, dict | None, str]:
+    """Run hook-user-prompt with LEAK_GUARD_STATE_DIR pointing to state_dir."""
+    event = {"hook_event_name": "UserPromptSubmit", "prompt": prompt, "session_id": "test"}
+    result = subprocess.run(
+        [sys.executable, str(SCANNER), "hook-user-prompt"],
+        input=json.dumps(event),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "LEAK_GUARD_STATE_DIR": str(state_dir)},
+    )
+    out = None
+    if result.stdout.strip():
+        try:
+            out = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            pass
+    return result.returncode, out, result.stderr
 
 
-class TestActionPicker:
-    """Unit-level tests for _action_picker via the scanner module."""
+class TestPromptInjectedPicker:
+    """Tests for the prompt-injected action picker (Turn 1 + Turn 2 flow)."""
 
-    def setup_method(self):
-        self.allow = sc.Allowlist()
-        self.rules = sc.load_pii_rules()
+    _CRED = "ScdsJCCKLSLKDKLCNLKCEINK2233as"
 
-    def _findings_with_raw(self, prompt: str) -> list:
-        """Return findings with raw_match populated for a prompt containing _AWS."""
-        findings = sc.scan_secrets_fast(prompt, source="<test>")
-        return findings
+    def test_detection_writes_pending_and_blocks(self, tmp_path):
+        """Turn 1: detection writes pending_action.json and exits 2."""
+        state = tmp_path / "state"
+        state.mkdir(mode=0o700)
+        rc, out, _ = _run_hook_with_state(state, f"here is my new pass CSKC:{self._CRED}")
+        assert rc == 2
+        assert out is not None and out.get("decision") == "block"
+        pending_file = state / "pending_action.json"
+        assert pending_file.exists(), "pending_action.json should have been written"
+        data = json.loads(pending_file.read_text())
+        assert "prompt" in data
+        assert "redact_targets" in data
+        assert "findings_summary" in data
+        assert "expires_at" in data
+        # findings_summary must not contain raw_match
+        for fs in data["findings_summary"]:
+            assert self._CRED not in str(fs.get("preview", ""))
 
-    def test_action_picker_allow(self):
-        """User presses A — exit 0, prompt passes as-is."""
-        findings = self._findings_with_raw(f"key={_AWS}")
-        assert findings, "expected findings"
-        with mock_tty("a"):
-            rc, updated = sc._action_picker(findings, f"key={_AWS}", silent=False)
+    def test_choice_allow_resends_original(self, tmp_path):
+        """Turn 2 A: exits 0 and emits updatedUserPrompt == original."""
+        state = tmp_path / "state"
+        state.mkdir(mode=0o700)
+        original = f"here is my pass CSKC:{self._CRED}"
+        _make_pending(state, original, [self._CRED])
+        rc, out, _ = _run_hook_with_state(state, "A")
         assert rc == 0
-        assert updated is None
+        updated = (out or {}).get("hookSpecificOutput", {}).get("updatedUserPrompt")
+        assert updated == original
 
-    def test_action_picker_redact(self):
-        """User presses R — exit 0, prompt has [REDACTED] substituted."""
-        prompt = f"key={_AWS}"
-        findings = self._findings_with_raw(prompt)
-        assert findings, "expected findings"
-        with mock_tty("r"):
-            rc, updated = sc._action_picker(findings, prompt, silent=False)
+    def test_choice_redact_strips_target(self, tmp_path):
+        """Turn 2 R: exits 0 and updatedUserPrompt has [REDACTED] in place of target."""
+        state = tmp_path / "state"
+        state.mkdir(mode=0o700)
+        original = f"here is my pass CSKC:{self._CRED}"
+        _make_pending(state, original, [self._CRED])
+        rc, out, _ = _run_hook_with_state(state, "R")
         assert rc == 0
+        updated = (out or {}).get("hookSpecificOutput", {}).get("updatedUserPrompt")
         assert updated is not None
         assert "[REDACTED]" in updated
-        assert _AWS not in updated
+        assert self._CRED not in updated
 
-    def test_action_picker_delete(self):
-        """User presses D — exit 2 (block)."""
-        findings = self._findings_with_raw(f"key={_AWS}")
-        assert findings, "expected findings"
-        with mock_tty("d"):
-            rc, updated = sc._action_picker(findings, f"key={_AWS}", silent=False)
-        assert rc == 2
-        assert updated is None
-
-    def test_action_picker_default(self):
-        """User presses Enter (empty input) — exit 2 (default = block)."""
-        findings = self._findings_with_raw(f"key={_AWS}")
-        assert findings, "expected findings"
-        with mock_tty(""):
-            rc, updated = sc._action_picker(findings, f"key={_AWS}", silent=False)
+    def test_choice_discard_blocks(self, tmp_path):
+        """Turn 2 D: exits 2 (block)."""
+        state = tmp_path / "state"
+        state.mkdir(mode=0o700)
+        original = f"here is my pass CSKC:{self._CRED}"
+        _make_pending(state, original, [self._CRED])
+        rc, out, _ = _run_hook_with_state(state, "D")
         assert rc == 2
 
-    def test_action_picker_no_tty(self):
-        """When /dev/tty cannot be opened — fall back to exit 2."""
-        findings = self._findings_with_raw(f"key={_AWS}")
-        assert findings, "expected findings"
-        with patch.object(sc, "_open_tty", return_value=None):
-            rc, updated = sc._action_picker(findings, f"key={_AWS}", silent=False)
-        assert rc == 2
-        assert updated is None
-
-    def test_action_picker_silent(self):
-        """When silent_blocks=True — return exit 2 without opening tty."""
-        findings = self._findings_with_raw(f"key={_AWS}")
-        assert findings, "expected findings"
-        open_tty_called = []
-
-        def track_open_tty():
-            open_tty_called.append(True)
-            return None
-
-        with patch.object(sc, "_open_tty", side_effect=track_open_tty):
-            rc, updated = sc._action_picker(findings, f"key={_AWS}", silent=True)
-        assert rc == 2
-        assert not open_tty_called, "_open_tty should not be called in silent mode"
-
-    def test_action_picker_redact_stdout_format(self):
-        """Integration: R choice emits updatedUserPrompt JSON on stdout."""
-        prompt = f"key={_AWS}"
-        findings = sc.scan_secrets_fast(prompt, source="<test>")
-        assert findings, "expected findings"
-
-        captured = io.StringIO()
-        with mock_tty("r"):
-            rc, updated = sc._action_picker(findings, prompt, silent=False)
-            orig_stdout = sys.stdout
-            sys.stdout = captured
-            try:
-                if rc == 0 and updated is not None:
-                    sc.emit_allow_modified(updated)
-            finally:
-                sys.stdout = orig_stdout
-
+    def test_choice_expired_falls_through(self, tmp_path):
+        """Expired pending file: choice reply falls through to normal scan."""
+        state = tmp_path / "state"
+        state.mkdir(mode=0o700)
+        original = "some clean prompt"
+        _make_pending(state, original, [], expires_delta=-1)  # already expired
+        # "A" with expired pending should be treated as a normal prompt (clean)
+        rc, out, _ = _run_hook_with_state(state, "A")
+        # Clean prompt "A" passes through with exit 0
         assert rc == 0
-        assert updated is not None
-        out_text = captured.getvalue()
-        assert out_text, "expected stdout output"
-        out_json = json.loads(out_text)
-        assert "hookSpecificOutput" in out_json
-        assert "updatedUserPrompt" in out_json["hookSpecificOutput"]
-        assert "[REDACTED]" in out_json["hookSpecificOutput"]["updatedUserPrompt"]
+
+    def test_no_pending_no_intercept(self, tmp_path):
+        """No pending file: single-letter prompt is not intercepted as choice."""
+        state = tmp_path / "state"
+        state.mkdir(mode=0o700)
+        # No pending file written. "A" alone should pass through (clean prompt).
+        rc, out, _ = _run_hook_with_state(state, "A")
+        assert rc == 0
+        # Should NOT have emitted updatedUserPrompt (not intercepted as choice)
+        updated = (out or {}).get("hookSpecificOutput", {}).get("updatedUserPrompt")
+        assert updated is None
+
+    def test_block_message_contains_menu(self, tmp_path):
+        """Turn 1: block reason contains Allow, Redact, and Discard."""
+        state = tmp_path / "state"
+        state.mkdir(mode=0o700)
+        rc, out, _ = _run_hook_with_state(state, f"here is my new pass CSKC:{self._CRED}")
+        assert rc == 2
+        reason = (out or {}).get("reason", "")
+        assert "Allow" in reason
+        assert "Redact" in reason
+        assert "Discard" in reason
