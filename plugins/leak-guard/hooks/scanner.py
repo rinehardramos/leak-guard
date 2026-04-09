@@ -1037,8 +1037,12 @@ def emit_prompt_block(reason: str, *, silent: bool = False) -> None:
 
 
 def emit_allow_modified(updated_prompt: str) -> None:
-    """Allow the prompt through with a modified (redacted) version."""
-    out = {"hookSpecificOutput": {"updatedUserPrompt": updated_prompt}}
+    """Re-inject the original (or redacted) prompt as additionalContext.
+
+    UserPromptSubmit does not support updatedUserPrompt — only additionalContext.
+    We inject the prompt text so Claude sees it and responds to it.
+    """
+    out = {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": updated_prompt}}
     sys.stdout.write(json.dumps(out))
     sys.stdout.flush()
 
@@ -1261,13 +1265,15 @@ def _build_menu_text(findings: list) -> str:
 
 
 def emit_menu_prompt(menu_text: str) -> None:
-    """Replace the blocked prompt with the menu question so Claude renders it visibly.
+    """Inject the action picker menu as additionalContext so Claude sees and responds to it.
 
-    Exits 0 with updatedUserPrompt — the secret is NOT included.  Claude sees
-    only the menu text and asks the user for A/R/D/F.  This is more reliable
-    than exit 2 + reason, which Claude Code renders as a silent notification.
+    UserPromptSubmit hookSpecificOutput only supports `additionalContext` (not
+    `updatedUserPrompt` which is PreToolUse-only).  Exit 0 + additionalContext
+    injects the text as a meta message Claude reads — Claude then asks the user
+    for A/R/D/F.  The original secret-bearing prompt is withheld by exit 2 on
+    the block branches; this is called only from the Turn 2 allow path.
     """
-    out = {"hookSpecificOutput": {"updatedUserPrompt": menu_text}}
+    out = {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": menu_text}}
     sys.stdout.write(json.dumps(out))
     sys.stdout.flush()
 
@@ -1330,8 +1336,8 @@ def hook_user_prompt() -> int:
         # menu question.  Claude renders it visibly in the chat UI.  The original
         # prompt (with the secret) is stored in pending_action.json only — it never
         # reaches the model.
-        emit_prompt_block(menu, silent=silent)
-        return 2
+        emit_menu_prompt(menu)
+        return 0
 
     # [allow-once] prefix: skip heuristic findings only (no definitive secrets above).
     if allow_once:
@@ -1345,15 +1351,15 @@ def hook_user_prompt() -> int:
         _maybe_emit_verifier_notice(top_rule, top_cat)
         _write_pending_action(prompt, heuristic_findings)
         menu = _build_menu_text(heuristic_findings)
-        emit_prompt_block(menu, silent=silent)
-        return 2
+        emit_menu_prompt(menu)
+        return 0
 
     if definitive_pii:
         audit("block_user_prompt_pii", {"count": len(definitive_pii)})
         _write_pending_action(prompt, definitive_pii)
         menu = _build_menu_text(definitive_pii)
-        emit_prompt_block(menu, silent=silent)
-        return 2
+        emit_menu_prompt(menu)
+        return 0
 
     return 0
 
