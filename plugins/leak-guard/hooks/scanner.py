@@ -1240,17 +1240,29 @@ def _handle_choice(choice: str, pending: dict) -> int:
 
 
 def _build_menu_text(findings: list) -> str:
-    """Build the action picker menu text displayed to the user via Claude's UI."""
-    lines = ["\U0001f6a8 leak-guard: suspicious content detected in your prompt.\n"]
+    """Build the action picker menu text shown to the user via Claude's chat UI."""
+    lines = ["\U0001f6a8 leak-guard intercepted your prompt — suspicious content detected.\n"]
     for f in findings:
         lines.append(f"  \u00b7 {f.rule_id} ({f.severity}) \u2014 {f.preview}")
-    lines.append("\n  Reply with your choice:")
+    lines.append("\n  Your original message was withheld. Reply with your choice:")
     lines.append("    A \u2014 Allow once (send original prompt as-is)")
     lines.append("    R \u2014 Redact (strip flagged content, send cleaned prompt)")
-    lines.append("    D \u2014 Discard (cancel \u2014 default if no reply within 5 min)")
+    lines.append("    D \u2014 Discard (cancel, default after 5 min)")
     lines.append("    F \u2014 Flag as false positive (allowlist + send)")
     lines.append("\n  Choice [A/R/D/F]:")
     return "\n".join(lines)
+
+
+def emit_menu_prompt(menu_text: str) -> None:
+    """Replace the blocked prompt with the menu question so Claude renders it visibly.
+
+    Exits 0 with updatedUserPrompt — the secret is NOT included.  Claude sees
+    only the menu text and asks the user for A/R/D/F.  This is more reliable
+    than exit 2 + reason, which Claude Code renders as a silent notification.
+    """
+    out = {"hookSpecificOutput": {"updatedUserPrompt": menu_text}}
+    sys.stdout.write(json.dumps(out))
+    sys.stdout.flush()
 
 
 # Prefix the user can prepend to bypass heuristic (non-gitleaks) findings for one submission.
@@ -1300,15 +1312,19 @@ def hook_user_prompt() -> int:
     definitive_pii = [f for f in pii if f.rule_id not in _HEURISTIC_RULE_IDS]
 
     if definitive_secrets:
-        # [allow-once] does NOT bypass definitive secret findings — block regardless.
+        # [allow-once] does NOT bypass definitive secret findings.
         audit("block_user_prompt_secret", {"count": len(definitive_secrets)})
         top_rule = definitive_secrets[0].rule_id
         top_cat = definitive_secrets[0].category
         _maybe_emit_verifier_notice(top_rule, top_cat)
         _write_pending_action(prompt, definitive_secrets)
         menu = _build_menu_text(definitive_secrets)
-        emit_prompt_block(menu, silent=silent)
-        return 2
+        # Exit 0 + updatedUserPrompt: replaces the secret-bearing prompt with the
+        # menu question.  Claude renders it visibly in the chat UI.  The original
+        # prompt (with the secret) is stored in pending_action.json only — it never
+        # reaches the model.
+        emit_menu_prompt(menu)
+        return 0
 
     # [allow-once] prefix: skip heuristic findings only (no definitive secrets above).
     if allow_once:
@@ -1322,15 +1338,15 @@ def hook_user_prompt() -> int:
         _maybe_emit_verifier_notice(top_rule, top_cat)
         _write_pending_action(prompt, heuristic_findings)
         menu = _build_menu_text(heuristic_findings)
-        emit_prompt_block(menu, silent=silent)
-        return 2
+        emit_menu_prompt(menu)
+        return 0
 
     if definitive_pii:
         audit("block_user_prompt_pii", {"count": len(definitive_pii)})
         _write_pending_action(prompt, definitive_pii)
         menu = _build_menu_text(definitive_pii)
-        emit_prompt_block(menu, silent=silent)
-        return 2
+        emit_menu_prompt(menu)
+        return 0
 
     return 0
 
