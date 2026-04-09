@@ -626,32 +626,24 @@ class TestDummyValues:
         normalized = sc._normalize_text(text)
         assert normalized.startswith("AKIA")
 
-    # ── Hostname false-positive suppression ──────────────────────────────────
+    # ── Hostname entropy findings are heuristic (action picker), not suppressed ─
 
-    def test_hostname_suppressed_bare(self):
-        """A plain hostname like 'my-MacBook-Pro' must not trigger entropy FP."""
-        assert sc._is_dummy_value("my-MacBook-Pro")
+    def test_hostname_not_in_dummy_values(self):
+        """Hostnames are NOT suppressed — they route through the action picker."""
+        # The heuristic path (action picker) handles these; _is_dummy_value must
+        # not silently drop them, since a hostname in a credential context is suspicious.
+        assert not sc._is_dummy_value("Rinehards-MacBook-Pro")
+        assert not sc._is_dummy_value("my-server.local")
 
-    def test_hostname_suppressed_local(self):
-        """Hostname with .local suffix must be suppressed."""
-        assert sc._is_dummy_value("Rinehards-MacBook-Pro.local")
-
-    def test_hostname_suppressed_dotcom(self):
-        """Public domain hostname must be suppressed."""
-        assert sc._is_dummy_value("api.example.com")
-
-    def test_hostname_not_over_suppressed(self):
-        """A real base64-like token must NOT be suppressed as hostname."""
-        # This contains slashes and + which are not valid hostname chars
-        import base64, os
-        token = base64.b64encode(os.urandom(24)).decode()
-        assert not sc._is_dummy_value(token)
-
-    def test_git_committer_line_no_fp(self):
-        """Full git committer line output must not produce FP findings."""
+    def test_git_committer_line_is_heuristic(self):
+        """A hostname in a committer line produces a heuristic finding, not a definitive block."""
         line = "Committer: Test User <testuser@My-MacBook-Pro.local>"
         findings = sc.scan_entropy(line, "test", sc.load_allowlist())
-        assert findings == [], f"FP in committer line: {findings}"
+        # If a finding fires, it must be heuristic (eligible for action picker, not auto-block)
+        for f in findings:
+            assert f.rule_id in sc._HEURISTIC_RULE_IDS, (
+                f"hostname produced a definitive (non-heuristic) finding: {f}"
+            )
 
     # ── Allow-once scoping (C02) ─────────────────────────────────────────────
 

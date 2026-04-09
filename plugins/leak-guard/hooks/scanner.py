@@ -423,26 +423,6 @@ _PLACEHOLDER_SHAPE_RE = re.compile(
     re.VERBOSE,
 )
 
-# Hostname pattern — matches strings that are structurally hostnames, not secrets.
-# Two accepted forms:
-#   1. Hyphenated bare hostname: word segments separated by hyphens, each starting
-#      with a letter.  Requires at least one hyphen so single bare words don't match.
-#      e.g. "Rinehards-MacBook-Pro", "web-server-01", "my-host.local"
-#   2. FQDN: at least two dot-separated labels (any alphanumeric, may have hyphens).
-#      e.g. "api.example.com", "testuser.local", "My-MacBook-Pro.local"
-# Single-label strings (no hyphen, no dot) are intentionally NOT suppressed — they
-# are indistinguishable from short tokens without structural evidence.
-_HOSTNAME_RE = re.compile(
-    r"(?x)"
-    # Form 1: hyphenated, each segment starts with a letter
-    r"^(?:[A-Za-z][A-Za-z0-9]*)(?:-[A-Za-z][A-Za-z0-9]*)+"
-    r"(?:\.(local|lan|internal|home|localdomain|com|net|org|io|dev|app|co))?$"
-    r"|"
-    # Form 2: FQDN — two or more dot-separated labels
-    r"^[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?"
-    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?){1,}"
-    r"(?:\.(local|lan|internal|home|localdomain|com|net|org|io|dev|app|co))?$",
-)
 
 
 def _normalize_dummy_candidate(val: str) -> str:
@@ -470,10 +450,6 @@ def _is_dummy_value(val: str) -> bool:
     # 40-char all-hex strings are git commit SHAs — not secrets.
     # Real secrets at this length use mixed case + digits or base64 chars.
     if len(norm) == 40 and all(c in "0123456789abcdef" for c in norm):
-        return True
-    # Hostnames: word(-word)+ optionally followed by a known TLD or .local.
-    # e.g. "Rinehards-MacBook-Pro" or "my-server.local" — never a secret.
-    if _HOSTNAME_RE.match(val.strip()):
         return True
     return False
 
