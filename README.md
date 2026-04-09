@@ -113,20 +113,29 @@ You choose: **allow** (logged), **deny** (Claude retries differently), or **canc
 
 ## Tuning false positives
 
-Create `~/.claude/leak-guard/allowlist.toml`:
+Create `~/.claude/leak-guard/allowlist.toml` to suppress known-safe values:
 
 ```toml
-# Exact strings to always allow (e.g. placeholder emails in docs)
-literal = ["noreply@yourcompany.com", "test@example.com"]
+# Exact strings to always allow (placeholder emails, test values, etc.)
+literal = ["no-reply@yourcompany.com", "test@example.com"]
 
 # Rule IDs to fully disable
 rule_ids = ["us-zip", "ipv4-private"]
 
-# Paths where all rules are suppressed
-path_globs = ["*/docs/examples/*", "*/tests/fixtures/*"]
+# Paths where all rules are suppressed (docs, fixtures, generated files)
+path_globs = ["*/docs/*", "*/tests/fixtures/*", "*/README.md"]
 ```
 
 Changes apply immediately — no restart needed.
+
+### Common cases
+
+| Trigger | Fix |
+|---|---|
+| Your git committer email in `git commit` output | Add your email to `literal` |
+| Placeholder emails in docs or READMEs | Add the file path to `path_globs` |
+| Test fixtures with synthetic PII | Add `*/tests/fixtures/*` to `path_globs` |
+| A noisy rule (e.g. ZIP codes in addresses) | Add the rule ID to `rule_ids` |
 
 ---
 

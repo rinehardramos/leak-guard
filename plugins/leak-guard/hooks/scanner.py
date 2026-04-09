@@ -643,17 +643,6 @@ def _extract_scannable_text(tool: str, tool_input: dict) -> str:
     return ""
 
 
-def _is_git_command(event: dict) -> bool:
-    """Return True when the Bash tool ran a git subcommand.
-
-    Git output routinely contains author/committer emails and other
-    metadata that are not leaks.  We still scan for secrets, but
-    suppress PII-only blocks for these commands.
-    """
-    cmd = (event.get("tool_input") or {}).get("command", "") or ""
-    return bool(re.match(r"\s*(?:export\s+[^\n]+\s*&&\s*)*git\b", cmd))
-
-
 def hook_post_tool() -> int:
     event = read_event()
     tool = event.get("tool_name", "")
@@ -668,11 +657,6 @@ def hook_post_tool() -> int:
     if not findings:
         return 0
     secrets, pii = classify(findings)
-    # Git output (commit metadata, log, status) legitimately contains emails
-    # and other PII-like patterns that are not leaks.  Skip PII-only blocks
-    # for git commands; secrets are always blocked regardless.
-    if tool == "Bash" and _is_git_command(event):
-        pii = []
     if secrets:
         audit("block_post_tool_secret", {"tool": tool, "source": source, "count": len(secrets)})
         emit_post_tool_block(
