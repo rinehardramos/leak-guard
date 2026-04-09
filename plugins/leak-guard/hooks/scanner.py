@@ -63,7 +63,7 @@ PII_CATEGORIES = {"pii"}
 # Claude Code tools we scan. Others pass through untouched.
 PRE_TOOL_SCAN_INPUT = {"Bash", "Write", "Edit", "WebFetch", "WebSearch"}
 PRE_TOOL_BLOCK_BY_PATH = {"Read", "NotebookEdit"}  # block sensitive filenames before reading
-POST_TOOL_SCAN_OUTPUT = {"Read", "Grep", "Bash", "NotebookEdit"}
+POST_TOOL_SCAN_OUTPUT = {"Read", "Bash", "NotebookEdit"}
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -510,12 +510,14 @@ def emit_post_tool_block(reason: str) -> None:
     out = {"decision": "block", "reason": reason}
     sys.stdout.write(json.dumps(out))
     sys.stdout.flush()
+    print(f"\n[leak-guard] {reason}", file=sys.stderr)
 
 
 def emit_prompt_block(reason: str) -> None:
     out = {"decision": "block", "reason": reason}
     sys.stdout.write(json.dumps(out))
     sys.stdout.flush()
+    print(f"\n[leak-guard] {reason}", file=sys.stderr)
 
 
 # Prefix the user can prepend to bypass heuristic (non-gitleaks) findings for one submission.
