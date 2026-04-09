@@ -86,6 +86,8 @@ class Finding:
     severity: str = "medium"
     source: str = ""       # file path or "<prompt>" / "<bash>" etc.
 
+    raw_match: str = field(default="", repr=False)  # internal only — never logged/displayed
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "rule_id": self.rule_id,
@@ -334,6 +336,7 @@ def scan_pii_text(text: str, rules: list[PiiRule], allow: Allowlist,
                 preview=redact_preview(matched, rule.id),
                 severity=rule.severity,
                 source=source,
+                raw_match=matched,
             ))
     return findings
 
@@ -512,6 +515,7 @@ def scan_entropy(text: str, allow: Allowlist, source: str = "") -> list[Finding]
             preview=redact_preview(candidate, f"entropy-{charset}"),
             severity="high",
             source=source,
+            raw_match=candidate,
         ))
 
     for m in _B64_RE.finditer(text):
@@ -554,6 +558,7 @@ def scan_fuzzy_credentials(text: str, allow: Allowlist, source: str = "") -> lis
             continue
         upto = text[:m.start()]
         line_no = upto.count("\n") + 1
+        full_match = m.group(0)
         findings.append(Finding(
             rule_id="fuzzy-prefixed-credential",
             category="secret",
@@ -562,6 +567,7 @@ def scan_fuzzy_credentials(text: str, allow: Allowlist, source: str = "") -> lis
             preview=redact_preview(value, "fuzzy-cred"),
             severity="high",
             source=source,
+            raw_match=full_match,
         ))
     # Custom fuzzy prefix rules from ~/.claude/leak-guard/custom_rules.toml
     custom = load_custom_rules()
@@ -583,6 +589,7 @@ def scan_fuzzy_credentials(text: str, allow: Allowlist, source: str = "") -> lis
                 preview=redact_preview(value, f"custom-{prefix}"),
                 severity="high",
                 source=source,
+                raw_match=m.group(0),
             ))
     return findings
 
@@ -672,6 +679,7 @@ def scan_secrets_fast(text: str, source: str = "") -> list[Finding]:
                 preview=redact_preview(matched, rule_id),
                 severity=severity,
                 source=source,
+                raw_match=matched,
             ))
     # Custom pattern rules from ~/.claude/leak-guard/custom_rules.toml
     custom = load_custom_rules()
@@ -691,6 +699,7 @@ def scan_secrets_fast(text: str, source: str = "") -> list[Finding]:
                 preview=redact_preview(matched, rule.get("rule_id", "custom")),
                 severity=rule.get("severity", "high"),
                 source=source,
+                raw_match=matched,
             ))
     return findings
 
@@ -774,6 +783,7 @@ def scan_secrets_gitleaks(text: str | None = None, path: str | None = None,
                 preview=redact_preview(raw, rule_id),
                 severity="critical",
                 source=source_label or item.get("File", str(path or "<text>")),
+                raw_match=raw,
             ))
 
         if result.returncode not in (0, 1):
@@ -1048,6 +1058,92 @@ def emit_prompt_block(reason: str, *, silent: bool = False) -> None:
         print(f"\n[leak-guard] {reason}", file=sys.stderr)
 
 
+def emit_allow_modified(updated_prompt: str) -> None:
+    """Allow the prompt through with a modified (redacted) version."""
+    out = {"hookSpecificOutput": {"updatedUserPrompt": updated_prompt}}
+    sys.stdout.write(json.dumps(out))
+    sys.stdout.flush()
+
+
+def _open_tty():
+    """Open /dev/tty for interactive I/O. Returns file or None if non-interactive."""
+    try:
+        return open("/dev/tty", "r+", buffering=1)
+    except OSError:
+        return None
+
+
+def _action_picker(findings: list, prompt: str, silent: bool) -> tuple:
+    """
+    Show interactive action menu when findings are detected.
+    Returns (exit_code, updated_prompt_or_none).
+    - (0, None)    -> allow as-is
+    - (0, text)    -> allow with modified prompt (redacted)
+    - (2, None)    -> block/discard
+    """
+    if silent:
+        return (2, None)
+
+    tty = _open_tty()
+    if tty is None:
+        return (2, None)
+
+    try:
+        # Build display
+        lines = ["\n\U0001f6a8 leak-guard: credential detected in your prompt.\n"]
+        for f in findings:
+            lines.append(f"  Rule: {f.rule_id} ({f.severity})")
+            lines.append(f"  Preview: {f.preview}\n")
+        lines.append("  What would you like to do?")
+        lines.append("  [A] Allow once — send prompt as-is")
+        lines.append("  [R] Redact — strip flagged token(s), then send")
+        lines.append("  [D] Delete — discard prompt entirely   (default)")
+        lines.append("  [F] Flag as false positive — allowlist + send")
+        lines.append("  > ")
+        tty.write("\n".join(lines))
+        tty.flush()
+
+        try:
+            ch = tty.read(1)
+            # consume rest of line
+            if ch != "\n":
+                tty.readline()
+        except KeyboardInterrupt:
+            return (2, None)
+
+        choice = ch.strip().lower() if ch else ""
+
+        if choice == "a":
+            return (0, None)
+        elif choice == "r":
+            redacted = prompt
+            for f in findings:
+                if f.raw_match:
+                    redacted = redacted.replace(f.raw_match, "[REDACTED]")
+            return (0, redacted)
+        elif choice == "f":
+            for f in findings:
+                if f.raw_match:
+                    try:
+                        subprocess.run(
+                            [sys.argv[0], "flag", "fp",
+                             "--literal", f.raw_match,
+                             "--reason", "user marked FP in action picker"],
+                            timeout=10,
+                        )
+                    except Exception:
+                        pass
+            return (0, None)
+        else:
+            # "d", Enter, or anything else → block
+            return (2, None)
+    finally:
+        try:
+            tty.close()
+        except Exception:
+            pass
+
+
 # Prefix the user can prepend to bypass heuristic (non-gitleaks) findings for one submission.
 _ALLOW_ONCE_PREFIX = "[allow-once]"
 
@@ -1097,8 +1193,17 @@ def hook_user_prompt() -> int:
         )
         if notice:
             reason += "\n" + notice
-        emit_prompt_block(reason, silent=silent)
-        return 2  # exit 2 = block (Claude Code enforces based on exit code)
+        rc, updated = _action_picker(definitive_secrets, prompt, silent)
+        if rc == 0 and updated is not None:
+            audit("allow_redacted_user_prompt", {"rules": [f.rule_id for f in definitive_secrets]})
+            emit_allow_modified(updated)
+            return 0
+        elif rc == 0:
+            audit("allow_once_user_prompt", {"rules": [f.rule_id for f in definitive_secrets]})
+            return 0
+        else:
+            emit_prompt_block(reason, silent=silent)
+            return 2
 
     # [allow-once] prefix: skip heuristic findings only (no definitive secrets above).
     if allow_once:
@@ -1113,18 +1218,36 @@ def hook_user_prompt() -> int:
         msg = _ask_message(heuristic_findings)
         if notice:
             msg += "\n" + notice
-        emit_prompt_block(msg, silent=silent)
-        return 2  # exit 2 = block
+        rc, updated = _action_picker(heuristic_findings, prompt, silent)
+        if rc == 0 and updated is not None:
+            audit("allow_redacted_user_prompt", {"rules": [f.rule_id for f in heuristic_findings]})
+            emit_allow_modified(updated)
+            return 0
+        elif rc == 0:
+            audit("allow_once_user_prompt", {"rules": [f.rule_id for f in heuristic_findings]})
+            return 0
+        else:
+            emit_prompt_block(msg, silent=silent)
+            return 2
 
     if definitive_pii:
         audit("block_user_prompt_pii", {"count": len(definitive_pii)})
         # PII rules are skipped by verifier (pattern-based, no useful synthetic)
-        emit_prompt_block(
+        pii_reason = (
             "leak-guard: PII detected in your prompt. Rephrase, redact, or add to allowlist "
-            f"(~/.claude/leak-guard/allowlist.toml).\n{format_summary(definitive_pii)}",
-            silent=silent,
+            f"(~/.claude/leak-guard/allowlist.toml).\n{format_summary(definitive_pii)}"
         )
-        return 2  # exit 2 = block
+        rc, updated = _action_picker(definitive_pii, prompt, silent)
+        if rc == 0 and updated is not None:
+            audit("allow_redacted_user_prompt", {"rules": [f.rule_id for f in definitive_pii]})
+            emit_allow_modified(updated)
+            return 0
+        elif rc == 0:
+            audit("allow_once_user_prompt", {"rules": [f.rule_id for f in definitive_pii]})
+            return 0
+        else:
+            emit_prompt_block(pii_reason, silent=silent)
+            return 2
 
     return 0
 

@@ -11,10 +11,13 @@ Run:
 
 from __future__ import annotations
 
+import io
 import json
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -649,3 +652,141 @@ class TestSelftest:
         )
         assert result.returncode == 0, f"selftest failed:\n{result.stdout}\n{result.stderr}"
         assert "OK" in result.stdout
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Action picker tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+original_open = open
+
+
+class _FakeTty:
+    """Write-only sink for the menu display, read-only source for user input."""
+
+    def __init__(self, choice: str):
+        self._reader = io.StringIO(choice + "\n")
+
+    def write(self, s: str) -> int:
+        return len(s)
+
+    def flush(self) -> None:
+        pass
+
+    def read(self, n: int = -1) -> str:
+        return self._reader.read(n)
+
+    def readline(self) -> str:
+        return self._reader.readline()
+
+    def close(self) -> None:
+        pass
+
+
+@contextmanager
+def mock_tty(choice: str):
+    """Simulate user typing a single character in the action picker."""
+    fake = _FakeTty(choice)
+    with patch.object(sc, "_open_tty", return_value=fake):
+        yield
+
+
+class TestActionPicker:
+    """Unit-level tests for _action_picker via the scanner module."""
+
+    def setup_method(self):
+        self.allow = sc.Allowlist()
+        self.rules = sc.load_pii_rules()
+
+    def _findings_with_raw(self, prompt: str) -> list:
+        """Return findings with raw_match populated for a prompt containing _AWS."""
+        findings = sc.scan_secrets_fast(prompt, source="<test>")
+        return findings
+
+    def test_action_picker_allow(self):
+        """User presses A — exit 0, prompt passes as-is."""
+        findings = self._findings_with_raw(f"key={_AWS}")
+        assert findings, "expected findings"
+        with mock_tty("a"):
+            rc, updated = sc._action_picker(findings, f"key={_AWS}", silent=False)
+        assert rc == 0
+        assert updated is None
+
+    def test_action_picker_redact(self):
+        """User presses R — exit 0, prompt has [REDACTED] substituted."""
+        prompt = f"key={_AWS}"
+        findings = self._findings_with_raw(prompt)
+        assert findings, "expected findings"
+        with mock_tty("r"):
+            rc, updated = sc._action_picker(findings, prompt, silent=False)
+        assert rc == 0
+        assert updated is not None
+        assert "[REDACTED]" in updated
+        assert _AWS not in updated
+
+    def test_action_picker_delete(self):
+        """User presses D — exit 2 (block)."""
+        findings = self._findings_with_raw(f"key={_AWS}")
+        assert findings, "expected findings"
+        with mock_tty("d"):
+            rc, updated = sc._action_picker(findings, f"key={_AWS}", silent=False)
+        assert rc == 2
+        assert updated is None
+
+    def test_action_picker_default(self):
+        """User presses Enter (empty input) — exit 2 (default = block)."""
+        findings = self._findings_with_raw(f"key={_AWS}")
+        assert findings, "expected findings"
+        with mock_tty(""):
+            rc, updated = sc._action_picker(findings, f"key={_AWS}", silent=False)
+        assert rc == 2
+
+    def test_action_picker_no_tty(self):
+        """When /dev/tty cannot be opened — fall back to exit 2."""
+        findings = self._findings_with_raw(f"key={_AWS}")
+        assert findings, "expected findings"
+        with patch.object(sc, "_open_tty", return_value=None):
+            rc, updated = sc._action_picker(findings, f"key={_AWS}", silent=False)
+        assert rc == 2
+        assert updated is None
+
+    def test_action_picker_silent(self):
+        """When silent_blocks=True — return exit 2 without opening tty."""
+        findings = self._findings_with_raw(f"key={_AWS}")
+        assert findings, "expected findings"
+        open_tty_called = []
+
+        def track_open_tty():
+            open_tty_called.append(True)
+            return None
+
+        with patch.object(sc, "_open_tty", side_effect=track_open_tty):
+            rc, updated = sc._action_picker(findings, f"key={_AWS}", silent=True)
+        assert rc == 2
+        assert not open_tty_called, "_open_tty should not be called in silent mode"
+
+    def test_action_picker_redact_stdout_format(self):
+        """Integration: R choice emits updatedUserPrompt JSON on stdout."""
+        prompt = f"key={_AWS}"
+        findings = sc.scan_secrets_fast(prompt, source="<test>")
+        assert findings, "expected findings"
+
+        captured = io.StringIO()
+        with mock_tty("r"):
+            rc, updated = sc._action_picker(findings, prompt, silent=False)
+            orig_stdout = sys.stdout
+            sys.stdout = captured
+            try:
+                if rc == 0 and updated is not None:
+                    sc.emit_allow_modified(updated)
+            finally:
+                sys.stdout = orig_stdout
+
+        assert rc == 0
+        assert updated is not None
+        out_text = captured.getvalue()
+        assert out_text, "expected stdout output"
+        out_json = json.loads(out_text)
+        assert "hookSpecificOutput" in out_json
+        assert "updatedUserPrompt" in out_json["hookSpecificOutput"]
+        assert "[REDACTED]" in out_json["hookSpecificOutput"]["updatedUserPrompt"]
