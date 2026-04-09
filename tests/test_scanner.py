@@ -429,6 +429,213 @@ class TestScanPath:
         assert "s3cr3tK3y" not in output
 
 
+class TestFuzzyCredentials:
+    # Low-entropy values styled after the original missed credential
+    # (mixed case + digits, repeating patterns) — gitleaks ignores these
+    # but the fuzzy detector catches the PREFIX:value structure.
+    _CRED = "ScdsJCCKLSLKDKLCNLKCEINK2233as"  # original value
+
+    def setup_method(self):
+        self.allow = sc.Allowlist()
+
+    def test_original_case_detected(self):
+        hits = sc.scan_fuzzy_credentials(
+            f"here is my new pass CSKC:{self._CRED}", self.allow
+        )
+        assert any(f.rule_id == "fuzzy-prefixed-credential" for f in hits)
+
+    def test_various_prefixes_detected(self):
+        cases = [
+            f"my pwd KEY:{self._CRED}",
+            f"set TOKEN:{self._CRED} in env",
+            f"SK:{self._CRED}",
+            f"AUTH:{self._CRED}",
+        ]
+        for prompt in cases:
+            hits = sc.scan_fuzzy_credentials(prompt, self.allow)
+            assert any(f.rule_id == "fuzzy-prefixed-credential" for f in hits), \
+                f"missed: {prompt}"
+
+    def test_plain_label_colon_not_flagged(self):
+        safe_cases = [
+            "NOTE: this is fine",
+            "ERROR: file not found",
+            "WARNING: disk full",
+            "TODO: fix this later",
+        ]
+        for text in safe_cases:
+            hits = sc.scan_fuzzy_credentials(text, self.allow)
+            assert not any(f.rule_id == "fuzzy-prefixed-credential" for f in hits), \
+                f"false positive on: {text}"
+
+    def test_allowlisted_value_skipped(self):
+        allow = sc.Allowlist(literal={self._CRED})
+        hits = sc.scan_fuzzy_credentials(f"CSKC:{self._CRED}", allow)
+        assert not hits
+
+    def test_preview_is_redacted(self):
+        hits = sc.scan_fuzzy_credentials(f"CSKC:{self._CRED}", self.allow)
+        for h in hits:
+            assert self._CRED not in h.preview
+
+    def test_hook_blocks_original_prompt(self):
+        """Integration: full hook-user-prompt must block the credential that was missed."""
+        rc, out, _ = run_hook(
+            "hook-user-prompt",
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": f"here is my new pass CSKC:{self._CRED}",
+                "session_id": "test",
+            },
+        )
+        assert rc == 0
+        assert out is not None
+        assert out.get("decision") == "block"
+
+
+class TestDummyValues:
+    """Verify that obvious placeholder values do not trigger FPs."""
+
+    def setup_method(self):
+        self.allow = sc.Allowlist()
+
+    # ── _is_dummy_value unit tests ───────────────────────────────────────────
+
+    def test_known_dummy_suppressed(self):
+        for val in ("helloworld", "changeme", "hunter2", "password123",
+                    "letmein", "admin", "test", "foobar", "placeholder"):
+            assert sc._is_dummy_value(val), f"expected dummy: {val!r}"
+
+    def test_real_value_not_suppressed(self):
+        real = ["xK9mLpQ7vXdYeZwBtA5", "ScdsJCCKLSLKDKLCNLKCEINK2233as",
+                "R8mN2kLpQ7vXdYeZwBt"]
+        for val in real:
+            assert not sc._is_dummy_value(val), f"wrongly flagged as dummy: {val!r}"
+
+    def test_structural_placeholders_suppressed(self):
+        for val in ("<YOUR_KEY_HERE>", "{{API_KEY}}", "${TOKEN}", "$SECRET_KEY"):
+            assert sc._is_dummy_value(val), f"expected placeholder: {val!r}"
+
+    def test_single_char_runs_suppressed(self):
+        for val in ("xxxxxxxx", "00000000", "********", "AAAAAAAAAA"):
+            assert sc._is_dummy_value(val), f"expected run-of-one: {val!r}"
+
+    def test_empty_suppressed(self):
+        assert sc._is_dummy_value("")
+        assert sc._is_dummy_value("''")
+        assert sc._is_dummy_value('""')
+
+    def test_credential_labels_not_in_dummy_set(self):
+        """M07 guard: credential-type labels must not be in _KNOWN_DUMMY_VALUES."""
+        labels = {"secret", "token", "apikey", "api_key", "credential",
+                  "mysecret", "mytoken", "dummytoken", "faketoken"}
+        for label in labels:
+            assert label not in sc._KNOWN_DUMMY_VALUES, (
+                f"M07 regression: {label!r} is in _KNOWN_DUMMY_VALUES — "
+                "it's a label, not a placeholder value"
+            )
+
+    # ── Integration: scan_entropy must not flag dummy values ─────────────────
+
+    def test_entropy_ignores_dummy_with_context(self):
+        """`password=helloworld` must not produce entropy findings."""
+        hits = sc.scan_entropy("password=helloworld", self.allow)
+        assert not hits, f"FP on dummy value: {hits}"
+
+    def test_entropy_ignores_placeholder_shape(self):
+        hits = sc.scan_entropy("api_key=<YOUR_API_KEY_HERE>", self.allow)
+        assert not hits
+
+    def test_entropy_still_fires_on_real_high_entropy(self):
+        real = "xK9mLpQ7vXdYeZwBtA5cJfHsUoIgPn3m"
+        hits = sc.scan_entropy(f"secret: {real}", self.allow)
+        assert hits, "real high-entropy value should still be caught"
+
+    # ── Integration: scan_fuzzy_credentials must not flag dummy prefix values ─
+
+    def test_fuzzy_ignores_dummy_value(self):
+        hits = sc.scan_fuzzy_credentials("KEY:helloworld", self.allow)
+        assert not hits, f"FP on dummy fuzzy value: {hits}"
+
+    def test_fuzzy_ignores_placeholder_shape(self):
+        hits = sc.scan_fuzzy_credentials("KEY:<YOUR_KEY_HERE>", self.allow)
+        assert not hits
+
+    # ── Integration: scan_pii_text RHS dummy suppression ────────────────────
+
+    def test_pii_ignores_assigned_dummy_password(self):
+        rules = sc.load_pii_rules()
+        hits = sc.scan_pii_text("password=helloworld", rules, self.allow)
+        assert not hits, f"FP on `password=helloworld`: {hits}"
+
+    def test_pii_ignores_assigned_changeme(self):
+        rules = sc.load_pii_rules()
+        hits = sc.scan_pii_text("secret_key=changeme", rules, self.allow)
+        assert not hits, f"FP on `secret_key=changeme`: {hits}"
+
+    def test_pii_does_not_crash_on_real_password(self):
+        rules = sc.load_pii_rules()
+        hits = sc.scan_pii_text("password=Tr0ub4dor&3", rules, self.allow)
+        assert isinstance(hits, list)
+
+    # ── Integration: full hook must not block dummy-value prompts ────────────
+
+    def test_hook_passes_dummy_password_prompt(self):
+        rc, out, _ = run_hook(
+            "hook-user-prompt",
+            {"hook_event_name": "UserPromptSubmit",
+             "prompt": "why does password=helloworld fail in my test?",
+             "session_id": "test"},
+        )
+        assert rc == 0
+        decision = (out or {}).get("decision", "allow")
+        assert decision != "block", (
+            f"FP: clean dummy-password prompt was blocked. reason="
+            f"{(out or {}).get('reason', '')}"
+        )
+
+    def test_hook_passes_placeholder_prompt(self):
+        rc, out, _ = run_hook(
+            "hook-user-prompt",
+            {"hook_event_name": "UserPromptSubmit",
+             "prompt": "set API_KEY=<YOUR_API_KEY_HERE> in your .env",
+             "session_id": "test"},
+        )
+        assert rc == 0
+        decision = (out or {}).get("decision", "allow")
+        assert decision != "block", "FP: placeholder-shape prompt blocked"
+
+    # ── Unicode normalization (H02) ───────────────────────────────────────────
+
+    def test_normalize_removes_zero_width(self):
+        text = "key: AKIA\u200bY3FDSNDKFKSIDJSW"
+        normalized = sc._normalize_text(text)
+        assert "\u200b" not in normalized
+
+    def test_normalize_nfkc(self):
+        # Fullwidth A (U+FF21) should NFKC-normalize to ASCII A
+        text = "\uff21KIA" + "Y3FDSNDKFKSIDJSW"
+        normalized = sc._normalize_text(text)
+        assert normalized.startswith("AKIA")
+
+    # ── Allow-once scoping (C02) ─────────────────────────────────────────────
+
+    def test_allow_once_does_not_bypass_definitive_secret(self):
+        """[allow-once] must NOT bypass a confirmed definitive secret."""
+        # Split to avoid triggering the scanner on this source file
+        aws = "AKIA" + "Y3FDSNDKFK" + "SIDJSW"
+        rc, out, _ = run_hook(
+            "hook-user-prompt",
+            {"hook_event_name": "UserPromptSubmit",
+             "prompt": f"[allow-once] export AWS_ACCESS_KEY_ID={aws}",
+             "session_id": "test"},
+        )
+        assert rc == 0
+        assert (out or {}).get("decision") == "block", (
+            "C02 regression: [allow-once] bypassed a definitive secret"
+        )
+
+
 class TestSelftest:
     def test_selftest_passes(self):
         result = subprocess.run(

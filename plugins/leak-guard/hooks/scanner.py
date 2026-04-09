@@ -107,6 +107,7 @@ class Allowlist:
     literal: set[str] = field(default_factory=set)
     rule_ids: set[str] = field(default_factory=set)        # globally suppressed rule ids
     path_globs: list[str] = field(default_factory=list)    # paths where all rules are suppressed
+    bash_globs: list[str] = field(default_factory=list)    # bash commands where PostToolUse output is suppressed
     silent_blocks: bool = False                             # suppress stderr user notifications
 
 
@@ -228,6 +229,7 @@ def load_allowlist() -> Allowlist:
             allow.literal.update(data.get("literal", []))
             allow.rule_ids.update(data.get("rule_ids", []))
             allow.path_globs.extend(data.get("path_globs", []))
+            allow.bash_globs.extend(data.get("bash_globs", []))
             if src == USER_ALLOWLIST:
                 allow.silent_blocks = bool(data.get("silent_blocks", False))
         except Exception as e:
@@ -388,6 +390,11 @@ _KNOWN_DUMMY_VALUES: frozenset[str] = frozenset({
     "test", "test123", "testing", "tester", "example", "sample", "demo",
     "placeholder", "redacted", "xxxxxx", "xxxxxxxx", "yyyyyy", "zzzzzz",
     "todo", "tbd", "none", "null", "undefined", "empty", "blank",
+    # Single common English words that can follow `=` / `:` in label/doc text
+    # and are obviously not credentials (e.g. "password= prefix" in test output)
+    "prefix", "suffix", "context", "value", "here", "example", "string",
+    "type", "format", "pattern", "mode", "field", "data", "input", "output",
+    "moderate", "high", "low", "yes", "no", "true", "false",
     # Explicit "not real" markers
     "fake", "dummy", "invalid", "mock", "stub", "fixture",
     "your_password_here", "your_token_here", "your_key_here",
@@ -1019,6 +1026,13 @@ def hook_post_tool() -> int:
     if tool == "Read":
         file_path = tool_input.get("file_path", "")
         if file_path and path_allowlisted(file_path, allow):
+            return 0
+    if tool == "Bash" and allow.bash_globs:
+        # Check both tool_input["command"] and the source label — PostToolUse
+        # events sometimes omit tool_input fields; source always contains the
+        # command text (up to 60 chars, which is enough for glob matching).
+        cmd = tool_input.get("command", "") or source
+        if any(fnmatch.fnmatch(cmd, g) for g in allow.bash_globs):
             return 0
     findings = scan_all(text=text, source_label=source)
     if not findings:
