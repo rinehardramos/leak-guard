@@ -55,6 +55,7 @@ GIT_HOOKS_DIR = PLUGIN_ROOT / "git-hooks"
 STATE_DIR = Path(os.environ.get("LEAK_GUARD_STATE_DIR", Path.home() / ".claude" / "leak-guard"))
 AUDIT_LOG = STATE_DIR / "audit.log"
 USER_ALLOWLIST = STATE_DIR / "allowlist.toml"
+CUSTOM_RULES_FILE = STATE_DIR / "custom_rules.toml"
 
 # Severity → policy
 SECRET_CATEGORIES = {"secret", "credential", "cloud-key", "private-key"}
@@ -114,9 +115,13 @@ class Allowlist:
 # ──────────────────────────────────────────────────────────────────────────
 
 def ensure_state_dir() -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if STATE_DIR.exists():
+        STATE_DIR.chmod(0o700)
+    else:
+        STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     if not AUDIT_LOG.exists():
         AUDIT_LOG.touch()
+        AUDIT_LOG.chmod(0o600)
 
 
 def audit(event: str, payload: dict[str, Any]) -> None:
@@ -193,11 +198,27 @@ def load_filename_blocklist() -> list[str]:
             if ln.strip() and not ln.strip().startswith("#")]
 
 
+def _allowlist_mtime() -> float:
+    """Combined mtime of both allowlist files — changes when either file is edited."""
+    total = 0.0
+    for src in (RULES_DIR / "allowlist.toml", USER_ALLOWLIST):
+        try:
+            total += src.stat().st_mtime
+        except OSError:
+            pass
+    return total
+
+
+_allowlist_cache: dict[str, object] = {"mtime": -1.0, "data": None}
+
+
 def load_allowlist() -> Allowlist:
+    mtime = _allowlist_mtime()
+    if _allowlist_cache["mtime"] == mtime and _allowlist_cache["data"] is not None:
+        return _allowlist_cache["data"]  # type: ignore[return-value]
+
     allow = Allowlist()
-    # Plugin default
     default = RULES_DIR / "allowlist.toml"
-    # User override
     for src in (default, USER_ALLOWLIST):
         if not src.exists():
             continue
@@ -207,17 +228,48 @@ def load_allowlist() -> Allowlist:
             allow.literal.update(data.get("literal", []))
             allow.rule_ids.update(data.get("rule_ids", []))
             allow.path_globs.extend(data.get("path_globs", []))
-            # Only the user allowlist may enable silent mode; the plugin
-            # default must never suppress user-facing notifications.
             if src == USER_ALLOWLIST:
                 allow.silent_blocks = bool(data.get("silent_blocks", False))
         except Exception as e:
             audit("allowlist_load_error", {"src": str(src), "error": str(e)})
+
+    _allowlist_cache["mtime"] = mtime
+    _allowlist_cache["data"] = allow
     return allow
 
 
 def path_allowlisted(path: str, allow: Allowlist) -> bool:
     return any(fnmatch.fnmatch(path, g) for g in allow.path_globs)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Custom rules (user-defined patterns / keywords / prefixes)
+# ──────────────────────────────────────────────────────────────────────────
+
+_custom_rules_cache: dict = {"mtime": -1.0, "data": None}
+
+
+def _custom_rules_mtime() -> float:
+    try:
+        return CUSTOM_RULES_FILE.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def load_custom_rules() -> dict:
+    mtime = _custom_rules_mtime()
+    if _custom_rules_cache["mtime"] == mtime and _custom_rules_cache["data"] is not None:
+        return _custom_rules_cache["data"]
+    data: dict = {"pattern": [], "context_keyword": [], "fuzzy_prefix": []}
+    if CUSTOM_RULES_FILE.exists():
+        try:
+            with CUSTOM_RULES_FILE.open("rb") as f:
+                data = tomllib.load(f)
+        except Exception as e:
+            audit("custom_rules_load_error", {"error": str(e)})
+    _custom_rules_cache["mtime"] = mtime
+    _custom_rules_cache["data"] = data
+    return data
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -247,6 +299,7 @@ def scan_pii_text(text: str, rules: list[PiiRule], allow: Allowlist,
     findings: list[Finding] = []
     if not text:
         return findings
+    text = _normalize_text(text)
     lines = text.splitlines() or [text]
     for rule in rules:
         if rule.id in allow.rule_ids:
@@ -257,6 +310,12 @@ def scan_pii_text(text: str, rules: list[PiiRule], allow: Allowlist,
                 continue
             if rule.luhn and not luhn_valid(matched):
                 continue
+            # Suppress dummy/placeholder RHS for assignment-style rules
+            # (e.g. `password=helloworld`, `api_key="changeme"`).
+            if "=" in matched or ":" in matched:
+                rhs = re.split(r"[:=]", matched, maxsplit=1)[-1]
+                if _is_dummy_value(rhs):
+                    continue
             # Locate line number
             upto = text[:m.start()]
             line_no = upto.count("\n") + 1
@@ -299,21 +358,121 @@ _URL_RE = re.compile(r'https?://', re.I)
 
 # Context keywords adjacent to the candidate that strongly suggest a secret.
 # We use these to *lower* the entropy threshold when present.
-_SECRET_CONTEXT_RE = re.compile(
-    r'(?i)(?:secret|token|password|passwd|api[_\s-]?key|auth|bearer|credential|private[_\s-]?key)',
+# Frozenset lookup is faster than a compiled regex for short keyword lists.
+# All entries are lowercase; callers must lower() the window before checking.
+_SECRET_CONTEXT_KEYWORDS: frozenset[str] = frozenset({
+    # Full words
+    "secret", "token", "password", "passwd", "pswd",
+    "credential", "cred", "bearer", "auth",
+    "private_key", "privkey", "access_key", "enc_key", "api_key", "apikey",
+    # Common abbreviations
+    "pass", "pwd", "pk", "sk", "pat", "jwt", "oauth", "psk",
+})
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Known dummy / placeholder values — suppresses FPs on obvious non-secrets like
+# `password=helloworld` or `api_key=changeme`. Strings are stored normalized
+# (lowercased, surrounding quotes stripped). Keep this list conservative:
+# every entry must be something that would NEVER be a real credential in
+# production code.
+# ──────────────────────────────────────────────────────────────────────────────
+_KNOWN_DUMMY_VALUES: frozenset[str] = frozenset({
+    # Canonical weak passwords / placeholders
+    "password", "password1", "password123", "passw0rd", "p@ssw0rd",
+    "123456", "12345678", "qwerty", "qwerty123", "letmein", "welcome",
+    "admin", "admin123", "root", "toor", "default", "changeme", "change_me",
+    "hunter2", "iloveyou", "dragon", "monkey", "master", "superman",
+    # Generic placeholders
+    "helloworld", "hello_world", "foo", "foobar", "bar", "baz", "qux",
+    "test", "test123", "testing", "tester", "example", "sample", "demo",
+    "placeholder", "redacted", "xxxxxx", "xxxxxxxx", "yyyyyy", "zzzzzz",
+    "todo", "tbd", "none", "null", "undefined", "empty", "blank",
+    # Explicit "not real" markers
+    "fake", "dummy", "invalid", "mock", "stub", "fixture",
+    "your_password_here", "your_token_here", "your_key_here",
+    "your_secret_here", "your_api_key_here",
+    "insert_password_here", "insert_token_here", "insert_key_here",
+})
+
+# Structural placeholder patterns — things like `<your-key>`, `{{API_KEY}}`,
+# `$SECRET`, `${TOKEN}`. Matches wrappers that are unambiguously templating.
+_PLACEHOLDER_SHAPE_RE = re.compile(
+    r"""^(
+        <[^<>]{1,80}>              # <your-key>
+      | \{\{[^{}]{1,80}\}\}        # {{API_KEY}}
+      | \$\{[^${}]{1,80}\}         # ${TOKEN}
+      | \$[A-Z_][A-Z0-9_]{0,40}    # $SECRET_TOKEN
+      | %[A-Z_][A-Z0-9_]{0,40}%    # %TOKEN%
+    )$""",
+    re.VERBOSE,
 )
+
+
+def _normalize_dummy_candidate(val: str) -> str:
+    """Lowercase and strip surrounding quotes/whitespace for dummy-set lookup."""
+    return val.strip().strip("'\"`").strip().lower()
+
+
+def _is_dummy_value(val: str) -> bool:
+    """Return True if *val* is an obvious placeholder / non-secret.
+
+    Two checks:
+    1. Exact match (normalized) against _KNOWN_DUMMY_VALUES.
+    2. Structural placeholder shapes like <...>, {{...}}, ${...}, $VAR.
+    """
+    norm = _normalize_dummy_candidate(val)
+    if not norm:
+        return True
+    if norm in _KNOWN_DUMMY_VALUES:
+        return True
+    # Runs of a single character (xxxxxxxx, 00000000, ********)
+    if len(norm) >= 4 and len(set(norm)) == 1:
+        return True
+    if _PLACEHOLDER_SHAPE_RE.match(val.strip()):
+        return True
+    return False
+
+
+# Characters that are purely visual/directional and should be stripped
+# before any scanning — zero-width spaces, bidi controls, BOM.
+_STRIP_UNICODE_RE = re.compile(
+    r'[\u200b\u200c\u200d\u200e\u200f'
+    r'\u202a\u202b\u202c\u202d\u202e'
+    r'\u2066\u2067\u2068\u2069\ufeff]'
+)
+
+
+def _normalize_text(text: str) -> str:
+    """NFKC-normalize and strip bidi/zero-width control characters."""
+    import unicodedata
+    text = unicodedata.normalize('NFKC', text)
+    text = _STRIP_UNICODE_RE.sub('', text)
+    return text
+
+
+def _has_secret_context(window: str) -> bool:
+    """Return True if any secret-context keyword appears in *window* (case-insensitive)."""
+    lower = window.lower()
+    if any(kw in lower for kw in _SECRET_CONTEXT_KEYWORDS):
+        return True
+    custom = load_custom_rules()
+    return any(entry.get("word", "") in lower for entry in custom.get("context_keyword", []))
 
 
 def scan_entropy(text: str, allow: Allowlist, source: str = "") -> list[Finding]:
     """Detect standalone high-entropy strings that look like tokens or keys."""
     if not text:
         return []
+    text = _normalize_text(text)
     findings: list[Finding] = []
     seen: set[str] = set()
 
     def _check(m: re.Match, charset: str, threshold: float) -> None:
         candidate = m.group(0)
         if candidate in seen or candidate in allow.literal:
+            return
+        if _is_dummy_value(candidate):
             return
         # Skip plain URLs
         start = max(0, m.start() - 8)
@@ -323,7 +482,7 @@ def scan_entropy(text: str, allow: Allowlist, source: str = "") -> list[Finding]
         ent = _shannon_entropy(candidate)
         # Lower threshold when a secret-like keyword appears within 60 chars
         ctx_window = text[max(0, m.start() - 60):m.end() + 60]
-        effective_threshold = threshold - 0.5 if _SECRET_CONTEXT_RE.search(ctx_window) else threshold
+        effective_threshold = threshold - 0.7 if _has_secret_context(ctx_window) else threshold
         if ent < effective_threshold:
             return
         seen.add(candidate)
@@ -344,6 +503,179 @@ def scan_entropy(text: str, allow: Allowlist, source: str = "") -> list[Finding]
     for m in _HEX_RE.finditer(text):
         _check(m, "hex", _HEX_ENTROPY_MIN)
 
+    return findings
+
+
+# Matches PREFIX:value where PREFIX is 2-12 uppercase alphanum chars and value
+# is 10+ mixed alphanumeric chars.  Catches custom credential schemes like
+# "CSKC:ScdsJCCKLSLKDKLCNLKCEINK2233as" that gitleaks has no rule for.
+_FUZZY_CRED_RE = re.compile(r'\b([A-Z][A-Z0-9]{1,11}):([A-Za-z0-9+/=_~-]{10,})')
+
+
+def scan_fuzzy_credentials(text: str, allow: Allowlist, source: str = "") -> list[Finding]:
+    """Detect PREFIX:value credential patterns not covered by gitleaks rules."""
+    if not text:
+        return []
+    text = _normalize_text(text)
+    findings: list[Finding] = []
+    for m in _FUZZY_CRED_RE.finditer(text):
+        prefix, value = m.group(1), m.group(2)
+        if value in allow.literal:
+            continue
+        if _is_dummy_value(value):
+            continue
+        # Require character-class diversity: plain uppercase words (e.g. "NOTE:")
+        # and version strings (e.g. "V2:something") are excluded.
+        has_upper = any(c.isupper() for c in value)
+        has_lower = any(c.islower() for c in value)
+        has_digit = any(c.isdigit() for c in value)
+        diversity = sum([has_upper, has_lower, has_digit])
+        if diversity < 2:
+            continue
+        # Skip URLs (already excluded by _URL_RE in entropy scan, replicate here)
+        start = max(0, m.start() - 8)
+        if _URL_RE.search(text[start:m.start()]):
+            continue
+        upto = text[:m.start()]
+        line_no = upto.count("\n") + 1
+        findings.append(Finding(
+            rule_id="fuzzy-prefixed-credential",
+            category="secret",
+            description=f"Possible custom credential with prefix '{prefix}:'",
+            line=line_no,
+            preview=redact_preview(value, "fuzzy-cred"),
+            severity="high",
+            source=source,
+        ))
+    # Custom fuzzy prefix rules from ~/.claude/leak-guard/custom_rules.toml
+    custom = load_custom_rules()
+    for entry in custom.get("fuzzy_prefix", []):
+        prefix = entry.get("prefix", "")
+        if not prefix:
+            continue
+        pat = re.compile(rf'\b{re.escape(prefix)}:([A-Za-z0-9+/=_~-]{{10,}})')
+        for m in pat.finditer(text):
+            value = m.group(1)
+            if value in allow.literal:
+                continue
+            upto = text[:m.start()]
+            findings.append(Finding(
+                rule_id=f"custom-prefix-{prefix.lower()}",
+                category="secret",
+                description=f"Custom credential prefix '{prefix}:'",
+                line=upto.count("\n") + 1,
+                preview=redact_preview(value, f"custom-{prefix}"),
+                severity="high",
+                source=source,
+            ))
+    return findings
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Fast pure-Python secret patterns (used for real-time prompt/tool hooks).
+# Pre-compiled at import time — no subprocess, no disk I/O on the hot path.
+# Rule coverage targets the highest-value secret types; gitleaks handles the
+# long tail for batch file scans where latency doesn't matter.
+# ──────────────────────────────────────────────────────────────────────────
+
+_FAST_RULES: list[tuple[str, re.Pattern, str]] = [
+    # (rule_id, pattern, severity)
+
+    # Cloud providers
+    ("aws-access-key-id",
+     re.compile(r'\bAKIA[0-9A-Z]{16}\b'), "critical"),
+    ("aws-secret-access-key",
+     re.compile(r'(?i)aws.{0,20}secret.{0,20}["\']?([A-Za-z0-9/+]{40})["\']?'), "critical"),
+
+    # Source-control tokens
+    ("github-pat",
+     re.compile(r'\bghp_[A-Za-z0-9]{36}\b'), "critical"),
+    ("github-oauth",
+     re.compile(r'\bgho_[A-Za-z0-9]{36}\b'), "critical"),
+    ("github-app-token",
+     re.compile(r'\bghs_[A-Za-z0-9]{36}\b'), "critical"),
+    ("github-user-token",
+     re.compile(r'\bghu_[A-Za-z0-9]{36}\b'), "critical"),
+    ("github-fine-grained-pat",
+     re.compile(r'\bgithub_pat_[A-Za-z0-9_]{82}\b'), "critical"),
+
+    # AI / API services
+    ("anthropic-api-key",
+     re.compile(r'\bsk-ant-api[0-9]{2}-[A-Za-z0-9\-_]{93,}\b'), "critical"),
+    ("openai-api-key",
+     re.compile(r'\bsk-proj-[A-Za-z0-9_\-]{50,}\b|\bsk-[A-Za-z0-9]{48}\b'), "critical"),
+
+    # Payment / comms
+    ("stripe-secret-key",
+     re.compile(r'\b(?:sk|rk)_live_[0-9a-zA-Z]{24,}\b'), "critical"),
+    ("sendgrid-api-key",
+     re.compile(r'\bSG\.[0-9A-Za-z\-_]{22}\.[0-9A-Za-z\-_]{43}\b'), "critical"),
+    ("twilio-api-key",
+     re.compile(r'\bSK[0-9a-fA-F]{32}\b'), "high"),
+    ("slack-token",
+     re.compile(r'\bxox[baprs]-[0-9a-zA-Z\-]{10,48}\b'), "critical"),
+
+    # Package registries
+    ("npm-token",
+     re.compile(r'\bnpm_[A-Za-z0-9]{36}\b'), "critical"),
+    ("pypi-token",
+     re.compile(r'\bpypi-[A-Za-z0-9\-_]{50,}\b'), "critical"),
+
+    # Generic high-signal patterns
+    ("google-api-key",
+     re.compile(r'\bAIza[0-9A-Za-z\-_]{35}\b'), "critical"),
+    ("private-key-header",
+     re.compile(r'-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----'), "critical"),
+    ("jwt-token",
+     re.compile(r'\beyJ[A-Za-z0-9\-_]{10,}\.[A-Za-z0-9\-_]{10,}\.[A-Za-z0-9\-_]{10,}\b'), "high"),
+    ("bearer-header",
+     re.compile(r'(?i)Authorization\s*:\s*Bearer\s+[A-Za-z0-9\-._~+/]{20,}=*'), "high"),
+    ("curl-auth-header",
+     re.compile(r"""(?i)-H\s+['"]?Authorization\s*:\s*Bearer\s+[A-Za-z0-9\-._~+/]{20,}"""), "high"),
+]
+
+
+def scan_secrets_fast(text: str, source: str = "") -> list[Finding]:
+    """Pure-Python secret scan — zero subprocesses, runs in microseconds.
+
+    Used for real-time hooks (UserPromptSubmit, PreToolUse, PostToolUse).
+    """
+    if not text:
+        return []
+    text = _normalize_text(text)
+    findings: list[Finding] = []
+    for rule_id, pattern, severity in _FAST_RULES:
+        for m in pattern.finditer(text):
+            matched = m.group(0)
+            upto = text[:m.start()]
+            findings.append(Finding(
+                rule_id=rule_id,
+                category="secret",
+                description=f"Possible {rule_id.replace('-', ' ')}",
+                line=upto.count("\n") + 1,
+                preview=redact_preview(matched, rule_id),
+                severity=severity,
+                source=source,
+            ))
+    # Custom pattern rules from ~/.claude/leak-guard/custom_rules.toml
+    custom = load_custom_rules()
+    for rule in custom.get("pattern", []):
+        try:
+            pat = re.compile(rule["regex"])
+        except re.error:
+            continue
+        for m in pat.finditer(text):
+            matched = m.group(0)
+            upto = text[:m.start()]
+            findings.append(Finding(
+                rule_id=rule.get("rule_id", "custom-pattern"),
+                category="secret",
+                description=rule.get("description", f"Custom rule: {rule.get('rule_id', '')}"),
+                line=upto.count("\n") + 1,
+                preview=redact_preview(matched, rule.get("rule_id", "custom")),
+                severity=rule.get("severity", "high"),
+                source=source,
+            ))
     return findings
 
 
@@ -455,18 +787,25 @@ def scan_all(text: str | None = None, path: str | None = None,
             return []
         findings.extend(scan_filename(path, load_filename_blocklist()))
 
-    # 2. Secrets via gitleaks
-    findings.extend(scan_secrets_gitleaks(text=text, path=path, source_label=source_label or path or "<text>"))
+    # 2. Secret detection — fast pure-Python path for text, gitleaks for files.
+    #    Real-time hooks always supply text; batch file scans supply path.
+    #    This keeps the hot path (per-prompt) subprocess-free.
+    if text is not None:
+        findings.extend(scan_secrets_fast(text, source=source_label))
+    if path is not None:
+        findings.extend(scan_secrets_gitleaks(path=path, source_label=source_label or path))
 
-    # 3. PII via regex
+    # 3. PII via regex + fuzzy credential patterns
     if text is not None:
         findings.extend(scan_pii_text(text, pii_rules, allow, source=source_label))
         findings.extend(scan_entropy(text, allow, source=source_label))
+        findings.extend(scan_fuzzy_credentials(text, allow, source=source_label))
     elif path is not None and Path(path).is_file():
         try:
             content = Path(path).read_text(errors="replace")
             findings.extend(scan_pii_text(content, pii_rules, allow, source=path))
             findings.extend(scan_entropy(content, allow, source=path))
+            findings.extend(scan_fuzzy_credentials(content, allow, source=path))
         except Exception:
             pass
 
@@ -554,11 +893,7 @@ def _ask_message(findings: list[Finding]) -> str:
 def hook_user_prompt() -> int:
     event = read_event()
     prompt = event.get("prompt", "") or ""
-
-    # Strip allow-once prefix → pass through heuristic checks for this submission only.
-    if prompt.lstrip().startswith(_ALLOW_ONCE_PREFIX):
-        audit("allow_once_bypass", {})
-        return 0  # let the prompt through unchanged
+    allow_once = prompt.lstrip().startswith(_ALLOW_ONCE_PREFIX)
 
     allow = load_allowlist()
     silent = allow.silent_blocks
@@ -571,6 +906,7 @@ def hook_user_prompt() -> int:
     definitive_pii = [f for f in pii if f.rule_id not in _HEURISTIC_RULE_IDS]
 
     if definitive_secrets:
+        # [allow-once] does NOT bypass definitive secret findings — block regardless.
         audit("block_user_prompt_secret", {"count": len(definitive_secrets)})
         emit_prompt_block(
             "leak-guard: secrets detected in your prompt. Please remove them before submitting.\n"
@@ -578,6 +914,11 @@ def hook_user_prompt() -> int:
             silent=silent,
         )
         return 0
+
+    # [allow-once] prefix: skip heuristic findings only (no definitive secrets above).
+    if allow_once:
+        audit("allow_once_bypass", {})
+        return 0  # let the prompt through unchanged
 
     if heuristic_findings:
         audit("ask_user_prompt_heuristic", {"count": len(heuristic_findings)})
@@ -669,9 +1010,16 @@ def hook_post_tool() -> int:
     text = _extract_response_text(tool, response)
     if not text:
         return 0
-    source = _extract_response_source(tool, event.get("tool_input", {}) or {})
+    tool_input = event.get("tool_input", {}) or {}
+    source = _extract_response_source(tool, tool_input)
     allow = load_allowlist()
     silent = allow.silent_blocks
+    # Honour path_globs for Read outputs — if the file path is allowlisted,
+    # skip scanning entirely (same logic as PreToolUse path check).
+    if tool == "Read":
+        file_path = tool_input.get("file_path", "")
+        if file_path and path_allowlisted(file_path, allow):
+            return 0
     findings = scan_all(text=text, source_label=source)
     if not findings:
         return 0
@@ -804,7 +1152,7 @@ def cmd_scan_path(target: str) -> int:
 
 
 def cmd_scan_text() -> int:
-    text = sys.stdin.read()
+    text = sys.stdin.read(_STDIN_MAX_BYTES)
     findings = scan_all(text=text, source_label="<stdin>")
     if findings:
         print(format_summary(findings, max_items=50), file=sys.stderr)
@@ -835,10 +1183,13 @@ def cmd_install_githook() -> int:
     return 0
 
 
+_SHA_RE = re.compile(r'^[0-9a-f]{40}$')
+
+
 def cmd_git_hook_pre_push() -> int:
     """Invoked from .git/hooks/pre-push. Scans HEAD vs upstream diff."""
     # Read refs from stdin per git's pre-push protocol
-    refs = sys.stdin.read().strip().splitlines()
+    refs = sys.stdin.read(_STDIN_MAX_BYTES).strip().splitlines()
     if not refs:
         return 0
     findings: list[Finding] = []
@@ -852,8 +1203,11 @@ def cmd_git_hook_pre_push() -> int:
         parts = line.split()
         if len(parts) < 4:
             continue
-        local_sha = parts[1]
-        remote_sha = parts[3]
+        local_sha = parts[1] if len(parts) > 1 else ""
+        remote_sha = parts[3] if len(parts) > 3 else ""
+        if not _SHA_RE.match(local_sha) or not _SHA_RE.match(remote_sha):
+            print("[leak-guard] invalid SHA in pre-push stdin, blocking push", file=sys.stderr)
+            return 1
         if local_sha == "0000000000000000000000000000000000000000":
             continue
         if remote_sha == "0000000000000000000000000000000000000000":
@@ -900,14 +1254,17 @@ def cmd_git_hook_pre_push() -> int:
 # Hook I/O
 # ──────────────────────────────────────────────────────────────────────────
 
+_STDIN_MAX_BYTES = 4 * 1024 * 1024  # 4 MB
+
+
 def read_event() -> dict:
     try:
-        raw = sys.stdin.read()
+        raw = sys.stdin.read(_STDIN_MAX_BYTES)
         if not raw.strip():
             return {}
         return json.loads(raw)
-    except json.JSONDecodeError:
-        return {}
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"malformed hook event JSON: {exc}") from exc
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -976,6 +1333,190 @@ def cmd_selftest() -> int:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Flag command — teach leak-guard from user feedback.
+# Appends to either the user allowlist (fp) or custom_rules.toml (fn).
+# ──────────────────────────────────────────────────────────────────────────
+
+def _toml_escape_literal(s: str) -> str:
+    """Quote a string for TOML. Prefer single-quoted literal strings so
+    regex backslashes survive without escaping. Fall back to basic string
+    only when the value contains a single quote."""
+    if "'" not in s and "\n" not in s:
+        return "'" + s + "'"
+    escaped = s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    return '"' + escaped + '"'
+
+
+def _append_to_file(path: Path, block: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existed = path.exists()
+    with path.open("a", encoding="utf-8") as f:
+        if not existed:
+            f.write(f"# leak-guard user-learned entries — managed by `scanner.py flag`\n")
+        f.write(block)
+
+
+def cmd_flag(args) -> int:
+    """Append a user feedback entry to the appropriate learned-state file."""
+    ensure_state_dir()
+    now = time.strftime("%Y-%m-%d")
+    reason = args.reason or f"user-flagged {now}"
+
+    if args.kind == "fp":
+        # False positive → suppress via allowlist.
+        if not (args.literal or args.suppress_rule):
+            print("flag fp: provide --literal <value> or --suppress-rule <rule_id>",
+                  file=sys.stderr)
+            return 2
+        block = f"\n# {reason}\n"
+        if args.literal:
+            # Append as TOML array fragment — if `literal` already exists in the
+            # user allowlist, the parser will merge multiple top-level keys only
+            # when rewritten, so we use a sectioned approach: write a new
+            # [[learned_fp]] table array that load_allowlist will also read.
+            # Simpler: rewrite the literal = [...] block by reading + appending.
+            return _append_literal(args.literal, reason)
+        if args.suppress_rule:
+            return _append_suppress_rule(args.suppress_rule, reason)
+
+    if args.kind == "fn":
+        # False negative → add a new detection rule.
+        if args.context_keyword:
+            return _append_custom_section(
+                "context_keyword",
+                {"word": args.context_keyword.lower()},
+                reason,
+            )
+        if args.fuzzy_prefix:
+            return _append_custom_section(
+                "fuzzy_prefix",
+                {"prefix": args.fuzzy_prefix},
+                reason,
+            )
+        if not (args.rule_id and args.pattern):
+            print("flag fn: provide --rule-id AND --pattern "
+                  "(or --context-keyword / --fuzzy-prefix for lightweight additions)",
+                  file=sys.stderr)
+            return 2
+        # Validate regex before writing.
+        try:
+            re.compile(args.pattern)
+        except re.error as e:
+            print(f"flag fn: invalid regex: {e}", file=sys.stderr)
+            return 2
+        entry = {
+            "rule_id": args.rule_id,
+            "regex": args.pattern,
+            "description": args.description or f"user-added {now}",
+            "severity": args.severity,
+        }
+        return _append_custom_section("pattern", entry, reason)
+
+    return 2
+
+
+def _append_literal(literal: str, reason: str) -> int:
+    """Append a single literal to the user allowlist's `literal` array.
+    Uses a simple file rewrite approach to preserve existing entries."""
+    path = USER_ALLOWLIST
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing_literals: list[str] = []
+    other_lines: list[str] = []
+    if path.exists():
+        try:
+            with path.open("rb") as f:
+                data = tomllib.load(f)
+            existing_literals = list(data.get("literal", []))
+            # Preserve non-literal keys by re-reading raw text and stripping
+            # the `literal = [...]` block.
+            raw = path.read_text(encoding="utf-8")
+            other_lines = _strip_toml_array(raw, "literal").splitlines()
+        except Exception as e:
+            print(f"flag fp: could not parse {path}: {e}", file=sys.stderr)
+            return 2
+    if literal in existing_literals:
+        print(f"[flag] literal already present — no change: {literal[:40]}")
+        return 0
+    existing_literals.append(literal)
+    # Rewrite: literal array first, then preserved content.
+    out_lines = ["literal = ["]
+    for lit in existing_literals:
+        out_lines.append(f"    {_toml_escape_literal(lit)},")
+    out_lines.append("]")
+    out_lines.append("")
+    if other_lines:
+        out_lines.append(f"# user-flagged fp {time.strftime('%Y-%m-%d')} — {reason}")
+        out_lines.extend(other_lines)
+    path.write_text("\n".join(out_lines).rstrip() + "\n", encoding="utf-8")
+    print(f"[flag] added literal to allowlist: {literal[:60]}")
+    return 0
+
+
+def _append_suppress_rule(rule_id: str, reason: str) -> int:
+    """Append to the user allowlist `rule_ids` array to globally suppress a rule."""
+    path = USER_ALLOWLIST
+    path.parent.mkdir(parents=True, exist_ok=True)
+    block = (
+        f"\n# user-flagged fp {time.strftime('%Y-%m-%d')} — {reason}\n"
+        f"rule_ids = [{_toml_escape_literal(rule_id)}]\n"
+    )
+    # Quick path: if rule_ids already exists, append by rewrite.
+    if path.exists():
+        try:
+            with path.open("rb") as f:
+                data = tomllib.load(f)
+            existing = set(data.get("rule_ids", []))
+            if rule_id in existing:
+                print(f"[flag] rule {rule_id} already suppressed — no change")
+                return 0
+            existing.add(rule_id)
+            raw = path.read_text(encoding="utf-8")
+            stripped = _strip_toml_array(raw, "rule_ids")
+            new_arr_lines = ["rule_ids = ["]
+            for rid in sorted(existing):
+                new_arr_lines.append(f"    {_toml_escape_literal(rid)},")
+            new_arr_lines.append("]")
+            path.write_text(
+                stripped.rstrip() + "\n\n"
+                + f"# user-flagged fp {time.strftime('%Y-%m-%d')} — {reason}\n"
+                + "\n".join(new_arr_lines) + "\n",
+                encoding="utf-8",
+            )
+            print(f"[flag] suppressed rule globally: {rule_id}")
+            return 0
+        except Exception as e:
+            print(f"flag fp: could not parse {path}: {e}", file=sys.stderr)
+            return 2
+    _append_to_file(path, block)
+    print(f"[flag] suppressed rule globally: {rule_id}")
+    return 0
+
+
+def _append_custom_section(section: str, entry: dict, reason: str) -> int:
+    """Append a [[section]] table to CUSTOM_RULES_FILE."""
+    path = CUSTOM_RULES_FILE
+    lines = [f"\n# user-flagged fn {time.strftime('%Y-%m-%d')} — {reason}",
+             f"[[{section}]]"]
+    for k, v in entry.items():
+        lines.append(f"{k} = {_toml_escape_literal(str(v))}")
+    lines.append("")
+    _append_to_file(path, "\n".join(lines))
+    print(f"[flag] added {section}: {entry.get('rule_id') or entry.get('prefix') or entry.get('word')}")
+    return 0
+
+
+def _strip_toml_array(raw: str, key: str) -> str:
+    """Remove a top-level `<key> = [ ... ]` block (single-line or multi-line)
+    so the caller can rewrite it. Preserves everything else verbatim."""
+    import re as _re
+    pat = _re.compile(
+        rf"^{_re.escape(key)}\s*=\s*\[[^\]]*\]\s*$",
+        _re.MULTILINE | _re.DOTALL,
+    )
+    return pat.sub("", raw)
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # main
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -992,6 +1533,31 @@ def main(argv: list[str]) -> int:
     sub.add_parser("install-githook")
     sub.add_parser("git-hook-pre-push")
     sub.add_parser("selftest")
+
+    # `flag` — user feedback loop: append allowlist / custom-rule entries so
+    # leak-guard learns from FP/FN/uncertain verdicts (see `tests/adversarial_suite.py`).
+    fp = sub.add_parser("flag",
+        help="Teach leak-guard from false-positive / false-negative feedback")
+    fp.add_argument("kind", choices=["fp", "fn"],
+        help="fp=suppress (allowlist), fn=add detection rule")
+    fp.add_argument("--literal",
+        help="[fp] Exact string to suppress globally")
+    fp.add_argument("--suppress-rule",
+        help="[fp] Rule ID to suppress globally (e.g. 'email')")
+    fp.add_argument("--rule-id",
+        help="[fn] New rule identifier, e.g. 'ssn-dot-variant'")
+    fp.add_argument("--pattern",
+        help="[fn] Regex pattern for detection")
+    fp.add_argument("--description", default="",
+        help="[fn] Human description (auto-dated if omitted)")
+    fp.add_argument("--severity", choices=["low","medium","high","critical"], default="high",
+        help="[fn] Severity level")
+    fp.add_argument("--context-keyword",
+        help="[fn] Add a context keyword (lowers entropy threshold near it)")
+    fp.add_argument("--fuzzy-prefix",
+        help="[fn] Add a custom PREFIX: credential format")
+    fp.add_argument("--reason", default="",
+        help="Note explaining why this entry was added")
 
     args = parser.parse_args(argv)
 
@@ -1015,16 +1581,18 @@ def main(argv: list[str]) -> int:
             return cmd_git_hook_pre_push()
         if args.cmd == "selftest":
             return cmd_selftest()
+        if args.cmd == "flag":
+            return cmd_flag(args)
     except Exception as e:
         audit("scanner_exception", {"cmd": args.cmd, "error": str(e), "tb": traceback.format_exc()[:2000]})
         # Fail-closed for hook events; pass-through for CLI
         if args.cmd.startswith("hook-"):
             if args.cmd == "hook-pre-tool":
-                emit_pre_tool("deny", f"leak-guard internal error (fail-closed): {e}")
+                emit_pre_tool("deny", "leak-guard internal error (fail-closed) — check audit log")
             elif args.cmd == "hook-user-prompt":
-                emit_prompt_block(f"leak-guard internal error (fail-closed): {e}")
+                emit_prompt_block("leak-guard internal error (fail-closed) — check audit log")
             elif args.cmd == "hook-post-tool":
-                emit_post_tool_block(f"leak-guard internal error (fail-closed): {e}")
+                emit_post_tool_block("leak-guard internal error (fail-closed) — check audit log")
             else:
                 print(f"leak-guard error: {e}", file=sys.stderr)
             return 0
