@@ -8,6 +8,22 @@
 
 ---
 
+## Demo
+
+**On-demand scan** — secrets and PII detected, raw values never shown:
+
+![scan-leaks demo](demo/scan-leaks.gif)
+
+**Hook protocol** — secret blocked at model boundary, PII surfaces ask dialog:
+
+![hook block demo](demo/hook-block.gif)
+
+**Selftest** — all 11 internal checks passing:
+
+![selftest demo](demo/selftest.gif)
+
+---
+
 ## What it does
 
 Every time Claude reads a file, runs a command, or receives your prompt — leak-guard scans the content locally for secrets and PII. If it finds something, it blocks the data from entering the model. The raw value never leaves your machine.
