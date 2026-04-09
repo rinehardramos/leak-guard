@@ -1098,7 +1098,7 @@ def hook_user_prompt() -> int:
         if notice:
             reason += "\n" + notice
         emit_prompt_block(reason, silent=silent)
-        return 0
+        return 2  # exit 2 = block (Claude Code enforces based on exit code)
 
     # [allow-once] prefix: skip heuristic findings only (no definitive secrets above).
     if allow_once:
@@ -1114,7 +1114,7 @@ def hook_user_prompt() -> int:
         if notice:
             msg += "\n" + notice
         emit_prompt_block(msg, silent=silent)
-        return 0
+        return 2  # exit 2 = block
 
     if definitive_pii:
         audit("block_user_prompt_pii", {"count": len(definitive_pii)})
@@ -1124,7 +1124,7 @@ def hook_user_prompt() -> int:
             f"(~/.claude/leak-guard/allowlist.toml).\n{format_summary(definitive_pii)}",
             silent=silent,
         )
-        return 0
+        return 2  # exit 2 = block
 
     return 0
 
@@ -1970,13 +1970,16 @@ def main(argv: list[str]) -> int:
         if args.cmd.startswith("hook-"):
             if args.cmd == "hook-pre-tool":
                 emit_pre_tool("deny", "leak-guard internal error (fail-closed) — check audit log")
+                return 2
             elif args.cmd == "hook-user-prompt":
                 emit_prompt_block("leak-guard internal error (fail-closed) — check audit log")
+                return 2
             elif args.cmd == "hook-post-tool":
                 emit_post_tool_block("leak-guard internal error (fail-closed) — check audit log")
+                return 0  # PostToolUse block is advisory (return 0, block via stdout)
             else:
                 print(f"leak-guard error: {e}", file=sys.stderr)
-            return 0
+                return 0
         print(f"leak-guard error: {e}", file=sys.stderr)
         return 2
     return 0

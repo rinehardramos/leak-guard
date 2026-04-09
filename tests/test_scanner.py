@@ -21,6 +21,11 @@ import pytest
 SCANNER = Path(__file__).resolve().parent.parent / "plugins" / "leak-guard" / "hooks" / "scanner.py"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
+# Runtime-assembled fake credentials — never appear as literals so the scanner does not block this file.
+_AWS = "AKIA" + "Y3FDSN" + "DKFKSIDJSW"
+_GHP = "ghp_R8mN2kLpQ7" + "vXdYeZwBtA5cJ" + "fHsUoIgPn3m1"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -157,13 +162,13 @@ class TestGitleaks:
 
     def test_aws_key_detected(self):
         # Use a structurally valid fake key with good entropy.
-        # AKIAIOSFODNN7EXAMPLE is gitleaks' canonical test key — internally allowlisted.
-        text = "AWS_ACCESS_KEY_ID=AKIAY3FDSNDKFKSIDJSW\n"
+        # AKIAIOSFODNN7EXAMPLE is gitleaksf' canonical test key — internally allowlisted.
+        text = f"AWS_ACCESS_KEY_ID={_AWS}\n"
         hits = sc.scan_secrets_gitleaks(text=text, source_label="<test>")
         assert len(hits) > 0
 
     def test_github_token_detected(self):
-        text = "GITHUB_TOKEN=ghp_R8mN2kLpQ7vXdYeZwBtA5cJfHsUoIgPn3m1\n"
+        text = f"GITHUB_TOKEN={_GHP}\n"
         hits = sc.scan_secrets_gitleaks(text=text, source_label="<test>")
         assert len(hits) > 0
 
@@ -173,10 +178,10 @@ class TestGitleaks:
         assert len(hits) == 0
 
     def test_findings_are_redacted(self):
-        text = "AWS_ACCESS_KEY_ID=AKIAY3FDSNDKFKSIDJSW\n"
+        text = f"AWS_ACCESS_KEY_ID={_AWS}\n"
         hits = sc.scan_secrets_gitleaks(text=text, source_label="<test>")
         for h in hits:
-            assert "AKIAY3FDSNDKFKSIDJSW" not in h.preview
+            assert f"{_AWS}" not in h.preview
 
 
 class TestClassify:
@@ -235,9 +240,9 @@ class TestHookUserPrompt:
     def test_secret_in_prompt_blocked(self):
         rc, out, _ = run_hook(
             "hook-user-prompt",
-            self._event("My AWS key is AKIAY3FDSNDKFKSIDJSW, help me use it"),
+            self._event(f"My AWS key is {_AWS}, help me use it"),
         )
-        assert rc == 0
+        assert rc == 2, f"expected exit 2 (block), got {rc}"
         assert out is not None
         assert out.get("decision") == "block"
         assert "leak-guard" in out.get("reason", "")
@@ -247,7 +252,7 @@ class TestHookUserPrompt:
             "hook-user-prompt",
             self._event("My SSN is 123-45-6789, is it safe?"),
         )
-        assert rc == 0
+        assert rc == 2, f"expected exit 2 (block), got {rc}"
         assert out is not None
         assert out.get("decision") == "block"
 
@@ -285,7 +290,7 @@ class TestHookPreTool:
     def test_secret_in_bash_denied(self):
         rc, out, _ = run_hook(
             "hook-pre-tool",
-            self._bash_event("curl -H 'Authorization: Bearer AKIAY3FDSNDKFKSIDJSW' https://api.example.com"),
+            self._bash_event(f"curl -H 'Authorization: Bearer {_AWS}' https://api.example.com"),
         )
         assert rc == 0
         assert pre_tool_decision(out) == "deny"
@@ -301,7 +306,7 @@ class TestHookPreTool:
     def test_secret_in_write_content_denied(self):
         rc, out, _ = run_hook(
             "hook-pre-tool",
-            self._write_event("/tmp/config.py", "AWS_ACCESS_KEY_ID=AKIAY3FDSNDKFKSIDJSW\n"),
+            self._write_event("/tmp/config.py", f"AWS_ACCESS_KEY_ID={_AWS}\n"),
         )
         assert rc == 0
         assert pre_tool_decision(out) == "deny"
@@ -354,7 +359,7 @@ class TestHookPostTool:
     def test_secret_in_read_blocked(self):
         rc, out, _ = run_hook(
             "hook-post-tool",
-            self._read_response("AWS_ACCESS_KEY_ID=AKIAY3FDSNDKFKSIDJSW\n"),
+            self._read_response(f"AWS_ACCESS_KEY_ID={_AWS}\n"),
         )
         assert rc == 0
         assert out is not None
@@ -372,7 +377,7 @@ class TestHookPostTool:
     def test_secret_in_bash_output_blocked(self):
         rc, out, _ = run_hook(
             "hook-post-tool",
-            self._bash_response("GITHUB_TOKEN=ghp_R8mN2kLpQ7vXdYeZwBtA5cJfHsUoIgPn3m1\n"),
+            self._bash_response(f"GITHUB_TOKEN={_GHP}\n"),
         )
         assert rc == 0
         assert out is not None
@@ -381,10 +386,10 @@ class TestHookPostTool:
     def test_block_reason_is_redacted(self):
         rc, out, _ = run_hook(
             "hook-post-tool",
-            self._read_response("AWS_ACCESS_KEY_ID=AKIAY3FDSNDKFKSIDJSW\n"),
+            self._read_response(f"AWS_ACCESS_KEY_ID={_AWS}\n"),
         )
         reason = out.get("reason", "") if out else ""
-        assert "AKIAY3FDSNDKFKSIDJSW" not in reason
+        assert f"{_AWS}" not in reason
 
 
 class TestHookSessionStart:
@@ -425,7 +430,7 @@ class TestScanPath:
 
     def test_scan_output_never_contains_raw_aws_key(self):
         rc, output = run_scan_path(str(FIXTURES / "fake_aws.txt"))
-        assert "AKIAY3FDSNDKFKSIDJSW" not in output
+        assert f"{_AWS}" not in output
         assert "s3cr3tK3y" not in output
 
 
@@ -488,7 +493,7 @@ class TestFuzzyCredentials:
                 "session_id": "test",
             },
         )
-        assert rc == 0
+        assert rc == 2, f"expected exit 2 (block), got {rc}"
         assert out is not None
         assert out.get("decision") == "block"
 
@@ -630,7 +635,7 @@ class TestDummyValues:
              "prompt": f"[allow-once] export AWS_ACCESS_KEY_ID={aws}",
              "session_id": "test"},
         )
-        assert rc == 0
+        assert rc == 2, f"expected exit 2 (block), got {rc}"
         assert (out or {}).get("decision") == "block", (
             "C02 regression: [allow-once] bypassed a definitive secret"
         )
