@@ -443,6 +443,10 @@ def _is_dummy_value(val: str) -> bool:
         return True
     if _PLACEHOLDER_SHAPE_RE.match(val.strip()):
         return True
+    # 40-char all-hex strings are git commit SHAs — not secrets.
+    # Real secrets at this length use mixed case + digits or base64 chars.
+    if len(norm) == 40 and all(c in "0123456789abcdef" for c in norm):
+        return True
     return False
 
 
