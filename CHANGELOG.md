@@ -5,6 +5,98 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.3.0] — 2026-04-10
+
+This release replaces every hard-block with an interactive action picker
+surfaced directly in Claude's chat UI, and removes the fragile dummy-value
+word-list that was creating silent blind spots.
+
+### Design principle change
+
+The scanner's job is to **notice and notify — not to decide**.  Prior
+releases tried to suppress "obvious" non-secrets via a growing word-list
+(`_KNOWN_DUMMY_VALUES`, ~50 entries).  Every entry was a potential silent
+false negative.  The new posture: flag everything suspicious and let the
+user sort it out via the action picker.
+
+### Added
+
+**Prompt-injected action picker (`pending_action.json` + Turn 2 flow)**
+
+When a suspicious string is detected the hook no longer hard-blocks.
+Instead it:
+
+1. Saves the original prompt to `~/.claude/leak-guard/pending_action.json`
+   (mode `0o600`, 5-minute TTL) along with `redact_targets` (raw matches,
+   for in-place redaction) and a sanitised `findings_summary` (no raw
+   match text).
+2. Exits **0** with `updatedUserPrompt` = the action picker menu — Claude
+   renders it as a normal chat message so the user sees it immediately.
+   The secret never travels to the model.
+3. On the user's next message (`A` / `R` / `D` / `F`), the hook reads
+   the pending file and acts:
+
+| Choice | Effect |
+|--------|--------|
+| **A** Allow once | Re-sends the original prompt as-is |
+| **R** Redact | Replaces each flagged token with `[REDACTED]`, sends cleaned prompt |
+| **D** Discard | Deletes pending file, blocks (exit 2) |
+| **F** Flag FP | Runs `flag fp --literal` for each target, then allows |
+
+Single-letter replies are only intercepted when a non-expired pending file
+exists — genuine one-letter prompts are never hijacked.
+
+Example menu shown in Claude's UI:
+
+```
+🚨 leak-guard intercepted your prompt — suspicious content detected.
+
+  · fuzzy-prefixed-credential (high) — CSKC:Scds…[REDACTED]
+
+  Your original message was withheld. Reply with your choice:
+    A — Allow once (send original prompt as-is)
+    R — Redact (strip flagged content, send cleaned prompt)
+    D — Discard (cancel, default after 5 min)
+    F — Flag as false positive (allowlist + send)
+
+  Choice [A/R/D/F]:
+```
+
+### Changed
+
+**`_is_dummy_value` stripped to structural-only suppression**
+
+Removed the `_KNOWN_DUMMY_VALUES` frozenset (~50 entries of "known weak
+passwords" and common English words).  Maintaining a word-list is fragile:
+every entry is a silent blind spot, and the list was already the source of
+the M07 audit finding.
+
+`_is_dummy_value` now suppresses only four structurally unambiguous cases:
+
+| Case | Example |
+|------|---------|
+| Empty / whitespace | `""`, `''` |
+| Single-character run | `xxxxxxxx`, `00000000` |
+| Template syntax wrapper | `<YOUR_KEY>`, `{{TOKEN}}`, `${VAR}`, `$ENV_VAR` |
+| 40-char lowercase hex | git commit SHAs |
+
+Everything else — including `helloworld`, `changeme`, hostnames — reaches
+the action picker and the user decides.
+
+### Fixed
+
+- **Action picker visibility** (`889baa6`): exit-2 `reason` was rendered
+  by Claude Code as a silent notification (spinner with no text).  Fixed by
+  exiting 0 with `updatedUserPrompt` = menu text so Claude renders it as a
+  visible chat message.
+- **C02 preserved under new flow**: `[allow-once]` with a definitive secret
+  still shows the menu rather than auto-allowing.  The secret is never sent
+  to the model regardless of the prefix.
+- **Allowlisted scanner state files**: `pending_action.json` and `audit.log`
+  added to `path_globs` so the scanner doesn't flag its own state files.
+
+---
+
 ## [0.2.0] — 2026-04-09
 
 This release is a significant hardening and intelligence update. It fixes real
@@ -210,5 +302,6 @@ Initial release.
 
 ---
 
+[0.3.0]: https://github.com/rinehardramos/leak-guard/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rinehardramos/leak-guard/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rinehardramos/leak-guard/releases/tag/v0.1.0
