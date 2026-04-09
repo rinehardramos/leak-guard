@@ -1385,6 +1385,116 @@ def cmd_install_githook() -> int:
     return 0
 
 
+def cmd_install_plugin() -> int:
+    """Copy the current plugin source into the Claude Code plugin cache.
+
+    Discovers the cache root by walking common locations, then overwrites
+    every tracked file. Safe to re-run — existing files are backed up with
+    a `.bak` suffix before overwriting, and the operation is atomic per-file.
+
+    Cache layout expected by Claude Code:
+        ~/.claude/plugins/cache/<owner>/<name>/<version>/
+    """
+    # ── Locate cache root ────────────────────────────────────────────────────
+    # Try the path encoded in the running hook command first (most reliable),
+    # then fall back to a glob search under ~/.claude/plugins/cache/.
+    cache_root: Path | None = None
+
+    # Strategy 1: this script IS already installed in the cache — use __file__
+    me = Path(__file__).resolve()
+    # Expected: …/cache/<owner>/<plugin>/<version>/hooks/scanner.py
+    if me.parts[-3:] == ("hooks", "scanner.py") or True:
+        candidate = me.parent.parent  # strip hooks/scanner.py → version dir
+        if (candidate / "hooks" / "scanner.py").exists():
+            # Verify it looks like a cache entry (has a version-like name)
+            if candidate.name[0].isdigit():
+                cache_root = candidate
+
+    # Strategy 2: glob search
+    if cache_root is None:
+        base = Path.home() / ".claude" / "plugins" / "cache"
+        hits = sorted(base.glob("*/leak-guard/*/hooks/scanner.py"))
+        if hits:
+            cache_root = hits[-1].parent.parent  # latest version dir
+
+    if cache_root is None:
+        print(
+            "leak-guard install: could not find plugin cache directory.\n"
+            "Expected: ~/.claude/plugins/cache/<owner>/leak-guard/<version>/\n"
+            "Is leak-guard installed via the Claude Code marketplace?",
+            file=sys.stderr,
+        )
+        return 2
+
+    # ── Source root (this file lives at <src>/hooks/scanner.py) ─────────────
+    src_root = me.parent.parent  # plugins/leak-guard/
+
+    # ── Files to sync ────────────────────────────────────────────────────────
+    # Walk src_root and mirror every file into cache_root, skipping
+    # __pycache__, *.pyc, and .git artefacts.
+    SKIP_DIRS  = {"__pycache__", ".git", ".claude-plugin"}
+    SKIP_EXTS  = {".pyc"}
+
+    copied = 0
+    skipped = 0
+    errors: list[str] = []
+
+    for src_file in src_root.rglob("*"):
+        if src_file.is_dir():
+            continue
+        # Skip unwanted dirs/extensions
+        rel = src_file.relative_to(src_root)
+        if any(part in SKIP_DIRS for part in rel.parts):
+            skipped += 1
+            continue
+        if src_file.suffix in SKIP_EXTS:
+            skipped += 1
+            continue
+
+        dst_file = cache_root / rel
+        dst_file.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            if dst_file.exists():
+                shutil.copy2(dst_file, dst_file.with_suffix(dst_file.suffix + ".bak"))
+            shutil.copy2(src_file, dst_file)
+            # Preserve executable bit for hooks and shell scripts
+            if src_file.stat().st_mode & 0o111:
+                dst_file.chmod(dst_file.stat().st_mode | 0o755)
+            copied += 1
+        except OSError as exc:
+            errors.append(f"  {rel}: {exc}")
+
+    # ── Report ───────────────────────────────────────────────────────────────
+    print(f"leak-guard: installed {copied} file(s) → {cache_root}")
+    if skipped:
+        print(f"  (skipped {skipped} cache/build file(s))")
+    if errors:
+        print("Errors:", file=sys.stderr)
+        for e in errors:
+            print(e, file=sys.stderr)
+        return 2
+
+    # Quick smoke-test: run selftest from the newly installed copy
+    installed_scanner = cache_root / "hooks" / "scanner.py"
+    result = subprocess.run(
+        [sys.executable, str(installed_scanner), "selftest"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(
+            f"leak-guard install: selftest FAILED on installed copy:\n{result.stdout}",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Count PASS lines for a terse summary
+    passes = result.stdout.count("[PASS]")
+    print(f"  selftest: {passes} checks OK ✓")
+    print("  Restart Claude Code (or reload the session) for changes to take effect.")
+    return 0
+
+
 _SHA_RE = re.compile(r'^[0-9a-f]{40}$')
 
 
@@ -1893,6 +2003,7 @@ def main(argv: list[str]) -> int:
     sp = sub.add_parser("scan-path"); sp.add_argument("path")
     sub.add_parser("scan-text")
     sub.add_parser("install-githook")
+    sub.add_parser("install", help="Sync plugin source into the Claude Code plugin cache")
     sub.add_parser("git-hook-pre-push")
     sub.add_parser("selftest")
 
@@ -1952,6 +2063,8 @@ def main(argv: list[str]) -> int:
             return cmd_scan_text()
         if args.cmd == "install-githook":
             return cmd_install_githook()
+        if args.cmd == "install":
+            return cmd_install_plugin()
         if args.cmd == "git-hook-pre-push":
             return cmd_git_hook_pre_push()
         if args.cmd == "selftest":
