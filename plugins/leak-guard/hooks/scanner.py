@@ -1330,8 +1330,8 @@ def hook_user_prompt() -> int:
         # menu question.  Claude renders it visibly in the chat UI.  The original
         # prompt (with the secret) is stored in pending_action.json only — it never
         # reaches the model.
-        emit_menu_prompt(menu)
-        return 0
+        emit_prompt_block(menu, silent=silent)
+        return 2
 
     # [allow-once] prefix: skip heuristic findings only (no definitive secrets above).
     if allow_once:
@@ -1345,15 +1345,15 @@ def hook_user_prompt() -> int:
         _maybe_emit_verifier_notice(top_rule, top_cat)
         _write_pending_action(prompt, heuristic_findings)
         menu = _build_menu_text(heuristic_findings)
-        emit_menu_prompt(menu)
-        return 0
+        emit_prompt_block(menu, silent=silent)
+        return 2
 
     if definitive_pii:
         audit("block_user_prompt_pii", {"count": len(definitive_pii)})
         _write_pending_action(prompt, definitive_pii)
         menu = _build_menu_text(definitive_pii)
-        emit_menu_prompt(menu)
-        return 0
+        emit_prompt_block(menu, silent=silent)
+        return 2
 
     return 0
 

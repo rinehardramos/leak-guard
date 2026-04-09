@@ -242,27 +242,23 @@ class TestHookUserPrompt:
         if out:
             assert out.get("decision") != "block"
 
-    def test_secret_in_prompt_intercepted(self):
-        """Secret prompt is replaced with action picker menu — secret never reaches model."""
+    def test_secret_in_prompt_blocked(self):
+        """Secret prompt must be blocked (exit 2)."""
         rc, out, _ = run_hook(
             "hook-user-prompt",
             self._event(f"My AWS key is {_AWS}, help me use it"),
         )
-        assert rc == 0, f"expected exit 0 (menu injected), got {rc}"
-        updated = (out or {}).get("hookSpecificOutput", {}).get("updatedUserPrompt", "")
-        assert "Allow" in updated, "menu must be in updatedUserPrompt"
-        assert _AWS not in updated, "secret must not appear in the prompt sent to model"
+        assert rc == 2, f"expected exit 2 (block), got {rc}"
+        assert (out or {}).get("decision") == "block"
 
-    def test_pii_in_prompt_intercepted(self):
-        """PII prompt is replaced with action picker menu."""
+    def test_pii_in_prompt_blocked(self):
+        """PII prompt must be blocked (exit 2)."""
         rc, out, _ = run_hook(
             "hook-user-prompt",
             self._event("My SSN is 123-45-6789, is it safe?"),
         )
-        assert rc == 0, f"expected exit 0 (menu injected), got {rc}"
-        updated = (out or {}).get("hookSpecificOutput", {}).get("updatedUserPrompt", "")
-        assert "Allow" in updated
-        assert "123-45-6789" not in updated
+        assert rc == 2, f"expected exit 2 (block), got {rc}"
+        assert (out or {}).get("decision") == "block"
 
 
 class TestHookPreTool:
@@ -491,8 +487,8 @@ class TestFuzzyCredentials:
         for h in hits:
             assert self._CRED not in h.preview
 
-    def test_hook_intercepts_original_prompt(self):
-        """Integration: hook replaces credential prompt with the action picker menu."""
+    def test_hook_blocks_original_prompt(self):
+        """Integration: hook must block the credential prompt (exit 2)."""
         rc, out, _ = run_hook(
             "hook-user-prompt",
             {
@@ -501,12 +497,9 @@ class TestFuzzyCredentials:
                 "session_id": "test",
             },
         )
-        # Exit 0: prompt replaced with menu (not hard-blocked — user decides)
-        assert rc == 0, f"expected exit 0 (menu injected), got {rc}"
+        assert rc == 2, f"expected exit 2 (block), got {rc}"
         assert out is not None
-        updated = out.get("hookSpecificOutput", {}).get("updatedUserPrompt", "")
-        assert "Allow" in updated, "menu must be in updatedUserPrompt"
-        assert self._CRED not in updated, "secret must not reach the model"
+        assert out.get("decision") == "block"
 
 
 class TestDummyValues:
@@ -616,11 +609,10 @@ class TestDummyValues:
              "prompt": f"[allow-once] export AWS_ACCESS_KEY_ID={aws}",
              "session_id": "test"},
         )
-        # Exit 0 + menu (not auto-allowed): secret replaced with picker, user must choose
-        assert rc == 0
-        updated = (out or {}).get("hookSpecificOutput", {}).get("updatedUserPrompt", "")
-        assert "Allow" in updated, "C02 regression: definitive secret must show menu, not pass through"
-        assert aws not in updated, "C02 regression: secret must not reach model even with [allow-once]"
+        assert rc == 2, f"expected exit 2 (block), got {rc}"
+        assert (out or {}).get("decision") == "block", (
+            "C02 regression: [allow-once] bypassed a definitive secret"
+        )
 
 
 class TestSelftest:
@@ -691,18 +683,13 @@ class TestPromptInjectedPicker:
 
     _CRED = "ScdsJCCKLSLKDKLCNLKCEINK2233as"
 
-    def test_detection_writes_pending_and_shows_menu(self, tmp_path):
-        """Turn 1: detection writes pending_action.json, exits 0, and sends menu as updatedUserPrompt."""
+    def test_detection_writes_pending_and_blocks(self, tmp_path):
+        """Turn 1: detection writes pending_action.json and blocks (exit 2)."""
         state = tmp_path / "state"
         state.mkdir(mode=0o700)
         rc, out, _ = _run_hook_with_state(state, f"here is my new pass CSKC:{self._CRED}")
-        # Exit 0: prompt is replaced with menu, not hard-blocked
-        assert rc == 0
-        # Menu is in updatedUserPrompt so Claude renders it visibly
-        updated = (out or {}).get("hookSpecificOutput", {}).get("updatedUserPrompt", "")
-        assert "Allow" in updated and "Redact" in updated and "Discard" in updated
-        # Secret must NOT appear in the menu sent to the model
-        assert self._CRED not in updated
+        assert rc == 2
+        assert (out or {}).get("decision") == "block"
         pending_file = state / "pending_action.json"
         assert pending_file.exists(), "pending_action.json should have been written"
         data = json.loads(pending_file.read_text())
@@ -769,13 +756,13 @@ class TestPromptInjectedPicker:
         updated = (out or {}).get("hookSpecificOutput", {}).get("updatedUserPrompt")
         assert updated is None
 
-    def test_block_message_contains_menu(self, tmp_path):
-        """Turn 1: menu is in updatedUserPrompt (visible in Claude UI), not in reason."""
+    def test_block_reason_contains_menu(self, tmp_path):
+        """Turn 1: block reason contains the A/R/D/F menu."""
         state = tmp_path / "state"
         state.mkdir(mode=0o700)
         rc, out, _ = _run_hook_with_state(state, f"here is my new pass CSKC:{self._CRED}")
-        assert rc == 0
-        updated = (out or {}).get("hookSpecificOutput", {}).get("updatedUserPrompt", "")
-        assert "Allow" in updated
-        assert "Redact" in updated
-        assert "Discard" in updated
+        assert rc == 2
+        reason = (out or {}).get("reason", "")
+        assert "Allow" in reason
+        assert "Redact" in reason
+        assert "Discard" in reason
