@@ -1521,13 +1521,9 @@ def hook_session_start() -> int:
     event = read_event()
     cwd = event.get("cwd", os.getcwd())
     gl = find_gitleaks()
-    ctx_parts = [
-        "leak-guard v0.3.0 active: hooks armed for secrets + PII.",
-        "",
-        _SELF_SUPPRESSION_INSTRUCTION,
-    ]
+    ctx_parts = ["leak-guard v0.3.0 active."]
     if not gl:
-        ctx_parts.append("\n⚠ gitleaks not installed — secret detection will fail-closed. Run: brew install gitleaks")
+        ctx_parts.append("⚠ gitleaks not installed — secret detection will fail-closed. Run: brew install gitleaks")
     # Quick filename scan (no content scan to stay fast)
     try:
         blocklist = load_filename_blocklist()
