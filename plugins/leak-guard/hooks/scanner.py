@@ -106,6 +106,7 @@ class Allowlist:
     literal: set[str] = field(default_factory=set)
     rule_ids: set[str] = field(default_factory=set)        # globally suppressed rule ids
     path_globs: list[str] = field(default_factory=list)    # paths where all rules are suppressed
+    silent_blocks: bool = False                             # suppress stderr user notifications
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -206,6 +207,10 @@ def load_allowlist() -> Allowlist:
             allow.literal.update(data.get("literal", []))
             allow.rule_ids.update(data.get("rule_ids", []))
             allow.path_globs.extend(data.get("path_globs", []))
+            # Only the user allowlist may enable silent mode; the plugin
+            # default must never suppress user-facing notifications.
+            if src == USER_ALLOWLIST:
+                allow.silent_blocks = bool(data.get("silent_blocks", False))
         except Exception as e:
             audit("allowlist_load_error", {"src": str(src), "error": str(e)})
     return allow
@@ -492,7 +497,7 @@ def format_summary(findings: list[Finding], max_items: int = 10) -> str:
 # Hook handlers
 # ──────────────────────────────────────────────────────────────────────────
 
-def emit_pre_tool(decision: str, reason: str, updated_input: dict | None = None) -> None:
+def emit_pre_tool(decision: str, reason: str, updated_input: dict | None = None, *, silent: bool = False) -> None:
     out: dict[str, Any] = {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -504,20 +509,24 @@ def emit_pre_tool(decision: str, reason: str, updated_input: dict | None = None)
         out["hookSpecificOutput"]["updatedInput"] = updated_input
     sys.stdout.write(json.dumps(out))
     sys.stdout.flush()
+    if not silent and decision in ("deny", "ask"):
+        print(f"\n[leak-guard] {reason}", file=sys.stderr)
 
 
-def emit_post_tool_block(reason: str) -> None:
+def emit_post_tool_block(reason: str, *, silent: bool = False) -> None:
     out = {"decision": "block", "reason": reason}
     sys.stdout.write(json.dumps(out))
     sys.stdout.flush()
-    print(f"\n[leak-guard] {reason}", file=sys.stderr)
+    if not silent:
+        print(f"\n[leak-guard] {reason}", file=sys.stderr)
 
 
-def emit_prompt_block(reason: str) -> None:
+def emit_prompt_block(reason: str, *, silent: bool = False) -> None:
     out = {"decision": "block", "reason": reason}
     sys.stdout.write(json.dumps(out))
     sys.stdout.flush()
-    print(f"\n[leak-guard] {reason}", file=sys.stderr)
+    if not silent:
+        print(f"\n[leak-guard] {reason}", file=sys.stderr)
 
 
 # Prefix the user can prepend to bypass heuristic (non-gitleaks) findings for one submission.
@@ -551,6 +560,8 @@ def hook_user_prompt() -> int:
         audit("allow_once_bypass", {})
         return 0  # let the prompt through unchanged
 
+    allow = load_allowlist()
+    silent = allow.silent_blocks
     findings = scan_all(text=prompt, source_label="<user-prompt>")
     secrets, pii = classify(findings)
 
@@ -563,20 +574,22 @@ def hook_user_prompt() -> int:
         audit("block_user_prompt_secret", {"count": len(definitive_secrets)})
         emit_prompt_block(
             "leak-guard: secrets detected in your prompt. Please remove them before submitting.\n"
-            + format_summary(definitive_secrets)
+            + format_summary(definitive_secrets),
+            silent=silent,
         )
         return 0
 
     if heuristic_findings:
         audit("ask_user_prompt_heuristic", {"count": len(heuristic_findings)})
-        emit_prompt_block(_ask_message(heuristic_findings))
+        emit_prompt_block(_ask_message(heuristic_findings), silent=silent)
         return 0
 
     if definitive_pii:
         audit("block_user_prompt_pii", {"count": len(definitive_pii)})
         emit_prompt_block(
             "leak-guard: PII detected in your prompt. Rephrase, redact, or add to allowlist "
-            f"(~/.claude/leak-guard/allowlist.toml).\n{format_summary(definitive_pii)}"
+            f"(~/.claude/leak-guard/allowlist.toml).\n{format_summary(definitive_pii)}",
+            silent=silent,
         )
         return 0
 
@@ -587,19 +600,21 @@ def hook_pre_tool() -> int:
     event = read_event()
     tool = event.get("tool_name", "")
     tool_input = event.get("tool_input", {}) or {}
+    allow = load_allowlist()
+    silent = allow.silent_blocks
 
     # 1. Path-based blocking for file-reading tools
     if tool in PRE_TOOL_BLOCK_BY_PATH:
         fpath = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
         if fpath:
-            allow = load_allowlist()
             if not path_allowlisted(fpath, allow):
                 fn_findings = scan_filename(fpath, load_filename_blocklist())
                 if fn_findings:
                     audit("deny_pre_tool_filename", {"tool": tool, "path": fpath})
                     emit_pre_tool(
                         "deny",
-                        f"leak-guard: sensitive file blocked ({fpath}).\n{format_summary(fn_findings)}"
+                        f"leak-guard: sensitive file blocked ({fpath}).\n{format_summary(fn_findings)}",
+                        silent=silent,
                     )
                     return 0
         return 0  # silent allow (zero tokens)
@@ -614,7 +629,8 @@ def hook_pre_tool() -> int:
                 audit("deny_pre_tool_secret", {"tool": tool, "count": len(secrets)})
                 emit_pre_tool(
                     "deny",
-                    f"leak-guard: secrets in {tool} input — blocked.\n{format_summary(secrets)}"
+                    f"leak-guard: secrets in {tool} input — blocked.\n{format_summary(secrets)}",
+                    silent=silent,
                 )
                 return 0
             if pii:
@@ -623,7 +639,8 @@ def hook_pre_tool() -> int:
                     "ask",
                     f"leak-guard: PII detected in {tool} input. Allow, deny, or cancel?\n"
                     f"{format_summary(pii)}\n"
-                    "To always allow similar: add to ~/.claude/leak-guard/allowlist.toml"
+                    "To always allow similar: add to ~/.claude/leak-guard/allowlist.toml",
+                    silent=silent,
                 )
                 return 0
     return 0  # silent allow (zero tokens)
@@ -653,6 +670,8 @@ def hook_post_tool() -> int:
     if not text:
         return 0
     source = _extract_response_source(tool, event.get("tool_input", {}) or {})
+    allow = load_allowlist()
+    silent = allow.silent_blocks
     findings = scan_all(text=text, source_label=source)
     if not findings:
         return 0
@@ -662,7 +681,8 @@ def hook_post_tool() -> int:
         emit_post_tool_block(
             f"leak-guard BLOCKED {tool} output from {source}: secrets present. "
             f"Content withheld from context.\n{format_summary(secrets)}\n"
-            "Action: remove secrets from the source, add the path to allowlist, or scan explicitly with /scan-leaks."
+            "Action: remove secrets from the source, add the path to allowlist, or scan explicitly with /scan-leaks.",
+            silent=silent,
         )
         return 0
     if pii:
@@ -670,7 +690,8 @@ def hook_post_tool() -> int:
         emit_post_tool_block(
             f"leak-guard BLOCKED {tool} output from {source}: PII present. "
             f"Content withheld.\n{format_summary(pii)}\n"
-            "Action: rephrase the query, or add the path/rule to ~/.claude/leak-guard/allowlist.toml."
+            "Action: rephrase the query, or add the path/rule to ~/.claude/leak-guard/allowlist.toml.",
+            silent=silent,
         )
         return 0
     return 0

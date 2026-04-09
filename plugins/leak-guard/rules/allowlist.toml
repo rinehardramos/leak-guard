@@ -1,9 +1,12 @@
 # leak-guard default allowlist (ships with the plugin).
 # User overrides live at ~/.claude/leak-guard/allowlist.toml and are merged on top.
 #
-# literal     — exact strings to ignore (case-sensitive)
-# rule_ids    — rule IDs to fully disable (e.g. "us-zip" if too noisy)
-# path_globs  — paths where ALL rules are suppressed (fnmatch globs)
+# literal        — exact strings to ignore (case-sensitive)
+# rule_ids       — rule IDs to fully disable (e.g. "us-zip" if too noisy)
+# path_globs     — paths where ALL rules are suppressed (fnmatch globs)
+# silent_blocks  — set to true in your USER allowlist to suppress stderr
+#                  notifications (blocks still happen; only the visible
+#                  warning is hidden). Default: false.
 
 literal = [
     # Common placeholder / dummy emails

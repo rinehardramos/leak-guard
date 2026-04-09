@@ -124,6 +124,10 @@ rule_ids = ["us-zip", "ipv4-private"]
 
 # Paths where all rules are suppressed (docs, fixtures, generated files)
 path_globs = ["*/docs/*", "*/tests/fixtures/*", "*/README.md"]
+
+# Set to true to suppress the stderr user notification when a block fires.
+# Blocks still happen and are still logged — only the visible warning is hidden.
+# silent_blocks = true
 ```
 
 Changes apply immediately — no restart needed.
