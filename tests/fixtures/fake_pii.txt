@@ -1,0 +1,9 @@
+Customer record
+----------------
+Name: Jane Doe
+Email: jane.doe@acme.com
+Phone: (555) 867-5309
+SSN: 123-45-6789
+DOB: 1985-03-14
+Address: 742 Evergreen Terrace Springfield
+Card: 4242 4242 4242 4242

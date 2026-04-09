@@ -1,0 +1,22 @@
+{
+  "name": "leak-guard",
+  "owner": {
+    "name": "Rinehard Ramos"
+  },
+  "metadata": {
+    "description": "Local-first PII & secret scanner for Claude Code — blocks leaks before they reach the model",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "leak-guard",
+      "source": "./plugins/leak-guard",
+      "description": "Scans prompts, tool I/O, and git pushes for secrets and PII. Three enforcement layers: Claude Code hooks, on-demand /scan-leaks skill, and a per-repo pre-push git hook.",
+      "category": "security",
+      "keywords": ["security", "secrets", "pii", "gitleaks", "privacy", "leak-detection"],
+      "license": "MIT",
+      "homepage": "https://github.com/rinehardramos/leak-guard",
+      "repository": "https://github.com/rinehardramos/leak-guard"
+    }
+  ]
+}

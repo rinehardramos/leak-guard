@@ -1,0 +1,37 @@
+#!/bin/bash
+# leak-guard pre-push hook
+# Blocks pushes that introduce secrets. Reads refs from stdin per git's
+# pre-push protocol and delegates to scanner.py.
+#
+# Bypass (NOT RECOMMENDED): git push --no-verify
+
+set -e
+
+# Locate scanner.py. Order:
+#   1. LEAK_GUARD_SCANNER env var
+#   2. Installed plugin cache (default CC plugin path)
+#   3. Development path
+SCANNER=""
+if [ -n "${LEAK_GUARD_SCANNER:-}" ] && [ -f "$LEAK_GUARD_SCANNER" ]; then
+    SCANNER="$LEAK_GUARD_SCANNER"
+elif [ -f "$HOME/.claude/plugins/cache/leak-guard/leak-guard/0.1.0/hooks/scanner.py" ]; then
+    SCANNER="$HOME/.claude/plugins/cache/leak-guard/leak-guard/0.1.0/hooks/scanner.py"
+elif [ -f "$HOME/Projects/leak-guard/plugins/leak-guard/hooks/scanner.py" ]; then
+    SCANNER="$HOME/Projects/leak-guard/plugins/leak-guard/hooks/scanner.py"
+else
+    # Fallback: search the plugin cache for any version
+    CANDIDATE=$(find "$HOME/.claude/plugins/cache" -name "scanner.py" -path "*leak-guard*" 2>/dev/null | head -1)
+    if [ -n "$CANDIDATE" ]; then
+        SCANNER="$CANDIDATE"
+    fi
+fi
+
+if [ -z "$SCANNER" ]; then
+    echo "leak-guard pre-push: scanner.py not found — BLOCKED" >&2
+    echo "  Set LEAK_GUARD_SCANNER=/path/to/scanner.py or reinstall the plugin" >&2
+    exit 1
+fi
+
+# Delegate. Git's pre-push protocol passes refs via stdin:
+#   <local_ref> <local_sha> <remote_ref> <remote_sha>\n ...
+python3 "$SCANNER" git-hook-pre-push

@@ -1,0 +1,32 @@
+# leak-guard default allowlist (ships with the plugin).
+# User overrides live at ~/.claude/leak-guard/allowlist.toml and are merged on top.
+#
+# literal     — exact strings to ignore (case-sensitive)
+# rule_ids    — rule IDs to fully disable (e.g. "us-zip" if too noisy)
+# path_globs  — paths where ALL rules are suppressed (fnmatch globs)
+
+literal = [
+    # Common placeholder / dummy emails
+    "user@example.com",
+    "test@example.com",
+    "admin@example.com",
+    "noreply@example.com",
+    "foo@bar.com",
+    # Dummy cards (documentation/test values — still Luhn-valid)
+    "4242 4242 4242 4242",
+    "4242424242424242",
+]
+
+rule_ids = [
+    # Disabled by default — too noisy on code. Enable by removing from this list
+    # in your user allowlist, or set severity high in pii.toml.
+    "us-zip",
+    "ipv4-private",
+]
+
+path_globs = [
+    "*/node_modules/*",
+    "*/.git/*",
+    "*/dist/*",
+    "*/build/*",
+]

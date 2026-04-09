@@ -1,0 +1,12 @@
+{
+  "name": "leak-guard",
+  "description": "Local-first PII & secret scanner. Blocks leaks before they reach the Claude model or a git remote.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Rinehard Ramos"
+  },
+  "homepage": "https://github.com/rinehardramos/leak-guard",
+  "repository": "https://github.com/rinehardramos/leak-guard",
+  "license": "MIT",
+  "keywords": ["security", "secrets", "pii", "gitleaks", "privacy"]
+}

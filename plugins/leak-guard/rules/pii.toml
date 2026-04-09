@@ -1,0 +1,65 @@
+# leak-guard PII rules
+# Each [[rule]] is a regex-based detector. Tune severity per your tolerance.
+# Python `re` syntax. Use non-capturing groups `(?:...)` where possible.
+
+[[rule]]
+id = "email"
+description = "Email address"
+severity = "low"
+regex = '''(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b'''
+
+[[rule]]
+id = "us-ssn"
+description = "US Social Security Number (XXX-XX-XXXX)"
+severity = "high"
+# Excludes obviously invalid ranges (000, 666, 9xx) and all-zero groups
+regex = '''\b(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b'''
+
+[[rule]]
+id = "us-phone"
+description = "US phone number"
+severity = "low"
+regex = '''\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}\b'''
+
+[[rule]]
+id = "credit-card"
+description = "Credit card number (Luhn-validated)"
+severity = "critical"
+luhn = true
+regex = '''\b(?:\d[ -]*?){13,19}\b'''
+
+[[rule]]
+id = "ipv4-private"
+description = "IPv4 address"
+severity = "low"
+regex = '''\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b'''
+
+[[rule]]
+id = "us-street-address"
+description = "US street address (loose)"
+severity = "medium"
+regex = '''(?i)\b\d{1,5}\s+[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\s+(?:St|Street|Ave|Avenue|Blvd|Boulevard|Rd|Road|Dr|Drive|Ln|Lane|Ct|Court|Way|Pl|Place|Pkwy|Parkway)\b\.?'''
+
+[[rule]]
+id = "us-zip"
+description = "US ZIP code (5 or 9 digit)"
+severity = "low"
+regex = '''\b\d{5}(?:-\d{4})?\b'''
+
+[[rule]]
+id = "iban"
+description = "IBAN (international bank account)"
+severity = "high"
+regex = '''\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b'''
+
+[[rule]]
+id = "passport-us"
+description = "US passport number (9 digits, contextual)"
+severity = "high"
+regex = '''(?i)passport[^\n]{0,20}\b[A-Z0-9]{9}\b'''
+
+[[rule]]
+id = "date-of-birth"
+description = "Date of birth (contextual)"
+severity = "medium"
+regex = '''(?i)(?:dob|date[_\s-]?of[_\s-]?birth|birthday|born)[^\n]{0,10}\b(?:\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}-\d{2}-\d{2})\b'''

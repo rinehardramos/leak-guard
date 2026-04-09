@@ -1,0 +1,7 @@
+This file contains no secrets or PII.
+
+Some generic content:
+  - version: 1.2.3
+  - status: active
+  - count: 42
+  - log level: info

@@ -1,0 +1,54 @@
+# leak-guard sensitive filename blocklist
+# fnmatch glob patterns. Lines starting with # are ignored.
+# Files matching ANY pattern are blocked from Read and flagged on SessionStart.
+
+# Env files
+.env
+.env.*
+*.env
+env.local
+env.production
+env.development
+
+# SSH / TLS keys
+id_rsa
+id_rsa.*
+id_dsa
+id_dsa.*
+id_ecdsa
+id_ecdsa.*
+id_ed25519
+id_ed25519.*
+*.pem
+*.key
+*.pfx
+*.p12
+*.jks
+*.keystore
+
+# Cloud credentials
+credentials
+credentials.json
+*credentials*.json
+*service-account*.json
+*serviceaccount*.json
+gcloud-*.json
+.aws/credentials
+.aws/config
+
+# Database / backup dumps
+*.sql.gz
+*.dump
+*.bak
+
+# Other secret stores
+.netrc
+.pgpass
+.npmrc
+.pypirc
+htpasswd
+.htpasswd
+secrets.yml
+secrets.yaml
+secrets.json
+vault-token
