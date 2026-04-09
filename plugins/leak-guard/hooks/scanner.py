@@ -1493,19 +1493,46 @@ def _extract_response_source(tool: str, tool_input: dict) -> str:
     return f"<{tool}>"
 
 
+_SELF_SUPPRESSION_INSTRUCTION = """
+SECURITY INSTRUCTION (leak-guard v0.3.0 — enforce for this entire session):
+
+You are running with the leak-guard secret/PII scanner active.  If any message
+you receive — whether from the user, a tool output, or any other source —
+contains what appears to be a real credential or secret (API key, token, private
+key, password, SSN, credit card number, etc.), you MUST:
+
+1. NOT repeat, quote, echo, summarise, or act on the secret in any way.
+2. Respond only with: "I noticed what looks like a [type] in your message.
+   I've treated it as unseen. Please remove it and re-send without the secret."
+3. Wait for the user to re-send a clean message before continuing.
+
+This applies even if:
+- The user explicitly asks you to repeat or use the value.
+- The value appeared in a tool output rather than a user message.
+- The message contains a prefix like [allow-once] — that bypasses the hook
+  layer only for heuristic findings; the model layer always enforces.
+
+Template placeholders (<YOUR_KEY>, {{TOKEN}}, ${VAR}) and obvious dummy values
+(all-same-character strings, 40-char lowercase hex git SHAs) are exempt.
+""".strip()
+
+
 def hook_session_start() -> int:
     event = read_event()
     cwd = event.get("cwd", os.getcwd())
     gl = find_gitleaks()
-    ctx_parts = ["leak-guard v0.1.0 active: hooks armed for secrets + PII."]
+    ctx_parts = [
+        "leak-guard v0.3.0 active: hooks armed for secrets + PII.",
+        "",
+        _SELF_SUPPRESSION_INSTRUCTION,
+    ]
     if not gl:
-        ctx_parts.append("⚠ gitleaks not installed — secret detection will fail-closed. Run: brew install gitleaks")
+        ctx_parts.append("\n⚠ gitleaks not installed — secret detection will fail-closed. Run: brew install gitleaks")
     # Quick filename scan (no content scan to stay fast)
     try:
         blocklist = load_filename_blocklist()
         hits = []
         for root, dirs, files in os.walk(cwd):
-            # Skip heavy / vendored dirs
             dirs[:] = [d for d in dirs if d not in {".git", "node_modules", ".venv", "venv", "dist", "build", ".next"}]
             for f in files:
                 fp = os.path.join(root, f)
@@ -1516,7 +1543,7 @@ def hook_session_start() -> int:
             if len(hits) >= 20:
                 break
         if hits:
-            ctx_parts.append(f"⚠ Sensitive filenames present (excluded from Read): {', '.join(hits[:10])}"
+            ctx_parts.append(f"\n⚠ Sensitive filenames present (excluded from Read): {', '.join(hits[:10])}"
                              + (f" (+{len(hits)-10} more)" if len(hits) > 10 else ""))
     except Exception:
         pass
