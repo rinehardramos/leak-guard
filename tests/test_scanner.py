@@ -502,29 +502,20 @@ class TestFuzzyCredentials:
 
 
 class TestDummyValues:
-    """Verify that obvious placeholder values do not trigger FPs."""
+    """Verify _is_dummy_value suppresses only structurally unambiguous non-secrets."""
 
     def setup_method(self):
         self.allow = sc.Allowlist()
 
-    # ── _is_dummy_value unit tests ───────────────────────────────────────────
-
-    def test_known_dummy_suppressed(self):
-        for val in ("helloworld", "changeme", "hunter2", "password123",
-                    "letmein", "admin", "test", "foobar", "placeholder"):
-            assert sc._is_dummy_value(val), f"expected dummy: {val!r}"
-
-    def test_real_value_not_suppressed(self):
-        real = ["xK9mLpQ7vXdYeZwBtA5", "ScdsJCCKLSLKDKLCNLKCEINK2233as",
-                "R8mN2kLpQ7vXdYeZwBt"]
-        for val in real:
-            assert not sc._is_dummy_value(val), f"wrongly flagged as dummy: {val!r}"
+    # ── _is_dummy_value: structural suppression only ─────────────────────────
 
     def test_structural_placeholders_suppressed(self):
+        """Template syntax wrappers are unambiguously not secrets."""
         for val in ("<YOUR_KEY_HERE>", "{{API_KEY}}", "${TOKEN}", "$SECRET_KEY"):
             assert sc._is_dummy_value(val), f"expected placeholder: {val!r}"
 
     def test_single_char_runs_suppressed(self):
+        """Runs of one repeated character are not secrets."""
         for val in ("xxxxxxxx", "00000000", "********", "AAAAAAAAAA"):
             assert sc._is_dummy_value(val), f"expected run-of-one: {val!r}"
 
@@ -533,76 +524,38 @@ class TestDummyValues:
         assert sc._is_dummy_value("''")
         assert sc._is_dummy_value('""')
 
-    def test_credential_labels_not_in_dummy_set(self):
-        """M07 guard: credential-type labels must not be in _KNOWN_DUMMY_VALUES."""
-        labels = {"secret", "token", "apikey", "api_key", "credential",
-                  "mysecret", "mytoken", "dummytoken", "faketoken"}
-        for label in labels:
-            assert label not in sc._KNOWN_DUMMY_VALUES, (
-                f"M07 regression: {label!r} is in _KNOWN_DUMMY_VALUES — "
-                "it's a label, not a placeholder value"
+    def test_git_sha_suppressed(self):
+        """40-char lowercase hex strings are git SHAs, not secrets."""
+        sha = "a3f2c1d4e5b6a7f8c9d0e1f2a3b4c5d6e7f8a9b0"
+        assert sc._is_dummy_value(sha)
+
+    def test_real_tokens_not_suppressed(self):
+        """Anything with real entropy / structure must reach the action picker."""
+        for val in ("xK9mLpQ7vXdYeZwBtA5", "ScdsJCCKLSLKDKLCNLKCEINK2233as",
+                    "changeme", "helloworld", "hunter2", "password123"):
+            assert not sc._is_dummy_value(val), (
+                f"wrongly suppressed (user should decide): {val!r}"
             )
 
-    # ── Integration: scan_entropy must not flag dummy values ─────────────────
+    # ── Integration: structural suppressions work end-to-end ─────────────────
 
-    def test_entropy_ignores_dummy_with_context(self):
-        """`password=helloworld` must not produce entropy findings."""
-        hits = sc.scan_entropy("password=helloworld", self.allow)
-        assert not hits, f"FP on dummy value: {hits}"
-
-    def test_entropy_ignores_placeholder_shape(self):
+    def test_placeholder_shape_not_flagged_by_entropy(self):
+        """Template syntax in a prompt must not produce entropy findings."""
         hits = sc.scan_entropy("api_key=<YOUR_API_KEY_HERE>", self.allow)
         assert not hits
 
-    def test_entropy_still_fires_on_real_high_entropy(self):
-        real = "xK9mLpQ7vXdYeZwBtA5cJfHsUoIgPn3m"
-        hits = sc.scan_entropy(f"secret: {real}", self.allow)
-        assert hits, "real high-entropy value should still be caught"
-
-    # ── Integration: scan_fuzzy_credentials must not flag dummy prefix values ─
-
-    def test_fuzzy_ignores_dummy_value(self):
-        hits = sc.scan_fuzzy_credentials("KEY:helloworld", self.allow)
-        assert not hits, f"FP on dummy fuzzy value: {hits}"
-
-    def test_fuzzy_ignores_placeholder_shape(self):
+    def test_placeholder_shape_not_flagged_by_fuzzy(self):
         hits = sc.scan_fuzzy_credentials("KEY:<YOUR_KEY_HERE>", self.allow)
         assert not hits
 
-    # ── Integration: scan_pii_text RHS dummy suppression ────────────────────
+    def test_entropy_fires_on_real_high_entropy(self):
+        """Real high-entropy values must still be caught."""
+        real = "xK9mLpQ7vXdYeZwBtA5cJfHsUoIgPn3m"
+        hits = sc.scan_entropy(f"secret: {real}", self.allow)
+        assert hits, "real high-entropy value should be caught"
 
-    def test_pii_ignores_assigned_dummy_password(self):
-        rules = sc.load_pii_rules()
-        hits = sc.scan_pii_text("password=helloworld", rules, self.allow)
-        assert not hits, f"FP on `password=helloworld`: {hits}"
-
-    def test_pii_ignores_assigned_changeme(self):
-        rules = sc.load_pii_rules()
-        hits = sc.scan_pii_text("secret_key=changeme", rules, self.allow)
-        assert not hits, f"FP on `secret_key=changeme`: {hits}"
-
-    def test_pii_does_not_crash_on_real_password(self):
-        rules = sc.load_pii_rules()
-        hits = sc.scan_pii_text("password=Tr0ub4dor&3", rules, self.allow)
-        assert isinstance(hits, list)
-
-    # ── Integration: full hook must not block dummy-value prompts ────────────
-
-    def test_hook_passes_dummy_password_prompt(self):
-        rc, out, _ = run_hook(
-            "hook-user-prompt",
-            {"hook_event_name": "UserPromptSubmit",
-             "prompt": "why does password=helloworld fail in my test?",
-             "session_id": "test"},
-        )
-        assert rc == 0
-        decision = (out or {}).get("decision", "allow")
-        assert decision != "block", (
-            f"FP: clean dummy-password prompt was blocked. reason="
-            f"{(out or {}).get('reason', '')}"
-        )
-
-    def test_hook_passes_placeholder_prompt(self):
+    def test_hook_passes_template_placeholder_prompt(self):
+        """A prompt containing only template syntax must pass through."""
         rc, out, _ = run_hook(
             "hook-user-prompt",
             {"hook_event_name": "UserPromptSubmit",
@@ -610,8 +563,7 @@ class TestDummyValues:
              "session_id": "test"},
         )
         assert rc == 0
-        decision = (out or {}).get("decision", "allow")
-        assert decision != "block", "FP: placeholder-shape prompt blocked"
+        assert (out or {}).get("decision", "allow") != "block"
 
     # ── Unicode normalization (H02) ───────────────────────────────────────────
 

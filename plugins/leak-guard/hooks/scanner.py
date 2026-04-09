@@ -380,76 +380,46 @@ _SECRET_CONTEXT_KEYWORDS: frozenset[str] = frozenset({
 })
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Known dummy / placeholder values — suppresses FPs on obvious non-secrets like
-# `password=helloworld` or `api_key=changeme`. Strings are stored normalized
-# (lowercased, surrounding quotes stripped). Keep this list conservative:
-# every entry must be something that would NEVER be a real credential in
-# production code.
-# ──────────────────────────────────────────────────────────────────────────────
-_KNOWN_DUMMY_VALUES: frozenset[str] = frozenset({
-    # Canonical weak passwords / placeholders
-    "password", "password1", "password123", "passw0rd", "p@ssw0rd",
-    "123456", "12345678", "qwerty", "qwerty123", "letmein", "welcome",
-    "admin", "admin123", "root", "toor", "default", "changeme", "change_me",
-    "hunter2", "iloveyou", "dragon", "monkey", "master", "superman",
-    # Generic placeholders
-    "helloworld", "hello_world", "foo", "foobar", "bar", "baz", "qux",
-    "test", "test123", "testing", "tester", "example", "sample", "demo",
-    "placeholder", "redacted", "xxxxxx", "xxxxxxxx", "yyyyyy", "zzzzzz",
-    "todo", "tbd", "none", "null", "undefined", "empty", "blank",
-    # Single common English words that can follow `=` / `:` in label/doc text
-    # and are obviously not credentials (e.g. "password= prefix" in test output)
-    "prefix", "suffix", "context", "value", "here", "example", "string",
-    "type", "format", "pattern", "mode", "field", "data", "input", "output",
-    "moderate", "high", "low", "yes", "no", "true", "false",
-    # Explicit "not real" markers
-    "fake", "dummy", "invalid", "mock", "stub", "fixture",
-    "your_password_here", "your_token_here", "your_key_here",
-    "your_secret_here", "your_api_key_here",
-    "insert_password_here", "insert_token_here", "insert_key_here",
-})
-
-# Structural placeholder patterns — things like `<your-key>`, `{{API_KEY}}`,
-# `$SECRET`, `${TOKEN}`. Matches wrappers that are unambiguously templating.
+# Structural template wrappers — unambiguously NOT secrets.
+# These are syntactic markers used in documentation and config templates.
+# We do NOT maintain a word-list of "known weak passwords" — those suppressions
+# are fragile, hard to keep correct, and create silent blind spots.  If something
+# looks like a credential assignment, the user should decide via the action picker.
 _PLACEHOLDER_SHAPE_RE = re.compile(
     r"""^(
-        <[^<>]{1,80}>              # <your-key>
-      | \{\{[^{}]{1,80}\}\}        # {{API_KEY}}
-      | \$\{[^${}]{1,80}\}         # ${TOKEN}
-      | \$[A-Z_][A-Z0-9_]{0,40}    # $SECRET_TOKEN
-      | %[A-Z_][A-Z0-9_]{0,40}%    # %TOKEN%
+        <[^<>]{1,80}>              # <your-key>  (angle-bracket template)
+      | \{\{[^{}]{1,80}\}\}        # {{API_KEY}} (Jinja/Mustache template)
+      | \$\{[^${}]{1,80}\}         # ${TOKEN}    (shell variable expansion)
+      | \$[A-Z_][A-Z0-9_]{0,40}    # $SECRET_TOKEN (env var reference)
+      | %[A-Z_][A-Z0-9_]{0,40}%    # %TOKEN%     (Windows-style env var)
     )$""",
     re.VERBOSE,
 )
 
 
-
-def _normalize_dummy_candidate(val: str) -> str:
-    """Lowercase and strip surrounding quotes/whitespace for dummy-set lookup."""
-    return val.strip().strip("'\"`").strip().lower()
-
-
 def _is_dummy_value(val: str) -> bool:
-    """Return True if *val* is an obvious placeholder / non-secret.
+    """Return True only for values that are *structurally* non-secrets.
 
-    Two checks:
-    1. Exact match (normalized) against _KNOWN_DUMMY_VALUES.
-    2. Structural placeholder shapes like <...>, {{...}}, ${...}, $VAR.
+    Deliberately minimal — the scanner's job is to notice and notify.
+    Anything ambiguous goes to the user via the action picker.
+
+    Suppressed:
+    - Empty / whitespace-only strings.
+    - Runs of a single repeated character (xxxxxxxx, 00000000, ********).
+    - Template syntax wrappers: <...>, {{...}}, ${...}, $VAR, %VAR%.
+    - 40-char all-lowercase-hex strings (git commit SHAs).
     """
-    norm = _normalize_dummy_candidate(val)
-    if not norm:
+    stripped = val.strip().strip("'\"`").strip()
+    if not stripped:
         return True
-    if norm in _KNOWN_DUMMY_VALUES:
+    # Runs of a single character — unambiguously not a real credential.
+    if len(stripped) >= 4 and len(set(stripped.lower())) == 1:
         return True
-    # Runs of a single character (xxxxxxxx, 00000000, ********)
-    if len(norm) >= 4 and len(set(norm)) == 1:
-        return True
+    # Template syntax — syntactic markers, never actual secrets.
     if _PLACEHOLDER_SHAPE_RE.match(val.strip()):
         return True
-    # 40-char all-hex strings are git commit SHAs — not secrets.
-    # Real secrets at this length use mixed case + digits or base64 chars.
-    if len(norm) == 40 and all(c in "0123456789abcdef" for c in norm):
+    # 40-char all-lowercase-hex → git SHA, not a secret.
+    if len(stripped) == 40 and all(c in "0123456789abcdef" for c in stripped.lower()):
         return True
     return False
 
