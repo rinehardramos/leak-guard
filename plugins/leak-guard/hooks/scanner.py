@@ -30,7 +30,15 @@ import subprocess
 import sys
 import tempfile
 import time
-import tomllib
+
+# Vendored `tomli` (MIT, https://github.com/hukkin/tomli) lives next to this
+# file in _vendor/ and serves as the cross-platform fallback for Python < 3.11.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "_vendor"))
+
+try:
+    import tomllib          # stdlib ≥ 3.11
+except ModuleNotFoundError:
+    import tomli as tomllib  # type: ignore[no-redef]  # vendored backport
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
