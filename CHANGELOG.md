@@ -111,6 +111,24 @@ New state files (all in `~/.claude/leak-guard/`):
 | `pending_verifications.jsonl` | Correlation IDs + rule metadata (no user content) |
 | `verifier_feedback.jsonl` | Ingested verdicts for the review flow |
 
+**`scanner.py install` subcommand**
+
+Automates syncing the plugin source into the Claude Code plugin cache
+(`~/.claude/plugins/cache/`). Previously, edits to the dev source had no
+effect until the cache was manually updated.
+
+```bash
+python3 plugins/leak-guard/hooks/scanner.py install
+```
+
+- Auto-discovers the cache root: checks `__file__` first (if already
+  running from cache), then falls back to a glob over the cache directory.
+- Mirrors all files from the source plugin root, skipping `__pycache__`,
+  `.pyc`, `.git`, and `.claude-plugin` metadata.
+- Creates a `.bak` backup of each existing file before overwriting.
+- Preserves executable bits on all copied files.
+- Runs `selftest` on the newly installed copy and prints a restart reminder.
+
 **Pentest suite improvements**
 
 - `tests/adversarial_suite.py --review`: interactive yes/no triage for
@@ -128,6 +146,14 @@ New state files (all in `~/.claude/leak-guard/`):
 
 ### Fixed
 
+- **Critical: `hook_user_prompt` exit-code enforcement.** All three block
+  branches (`definitive_secrets`, `heuristic_findings`, `definitive_pii`)
+  previously returned exit 0. Claude Code only enforces a `UserPromptSubmit`
+  block when the hook exits with code 2 — exit 0 silently allows the prompt
+  through regardless of the JSON payload. Fixed: all block paths now
+  `return 2`; `main()` fail-closed handler likewise emits exit 2 for
+  `hook-user-prompt` and `hook-pre-tool` (PostToolUse stays 0, as its block
+  is advisory via stdout JSON).
 - `hook_post_tool`: PostToolUse on `Read` tool now correctly honours
   `path_globs` before scanning output (was only checked in PreToolUse).
 - `silent_blocks` allowlist flag now suppresses stderr notifications
