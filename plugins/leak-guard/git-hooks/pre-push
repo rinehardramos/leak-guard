@@ -34,4 +34,6 @@ fi
 
 # Delegate. Git's pre-push protocol passes refs via stdin:
 #   <local_ref> <local_sha> <remote_ref> <remote_sha>\n ...
-python3 "$SCANNER" git-hook-pre-push
+PYTHON=$(command -v python3.11 || command -v python3.12 || command -v python3.13 || command -v python3.14 || \
+         /opt/homebrew/bin/python3 --version >/dev/null 2>&1 && echo /opt/homebrew/bin/python3 || echo python3)
+"$PYTHON" "$SCANNER" git-hook-pre-push
