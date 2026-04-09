@@ -57,6 +57,11 @@ AUDIT_LOG = STATE_DIR / "audit.log"
 USER_ALLOWLIST = STATE_DIR / "allowlist.toml"
 CUSTOM_RULES_FILE = STATE_DIR / "custom_rules.toml"
 
+# Verifier state files (Commit C — opt-in LLM cross-check)
+VERIFIER_CONFIG = STATE_DIR / "verifier.toml"
+PENDING_VERIFICATIONS = STATE_DIR / "pending_verifications.jsonl"
+VERIFIER_FEEDBACK = STATE_DIR / "verifier_feedback.jsonl"
+
 # Severity → policy
 SECRET_CATEGORIES = {"secret", "credential", "cloud-key", "private-key"}
 PII_CATEGORIES = {"pii"}
@@ -840,6 +845,170 @@ def format_summary(findings: list[Finding], max_items: int = 10) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Verifier (Commit C) — opt-in LLM cross-check via emitted prompts.
+# Never makes API calls. Never sends real user content anywhere.
+# ──────────────────────────────────────────────────────────────────────────
+
+import random as _random_mod
+
+
+def verifier_enabled() -> bool:
+    """Return True if the user has opted into the verifier."""
+    if not VERIFIER_CONFIG.exists():
+        return False
+    try:
+        with VERIFIER_CONFIG.open("rb") as f:
+            data = tomllib.load(f)
+        return bool(data.get("verifier_enabled", False))
+    except Exception:
+        return False
+
+
+# PII-category rule ids for which synthetic cross-check adds no value.
+_VERIFIER_SKIP_CATEGORIES = {"pii"}
+_VERIFIER_SKIP_RULE_PREFIXES = ("us-ssn", "credit-card", "us-phone", "email", "ssn",
+                                 "phone", "credit")
+
+
+def _verifier_skip_rule(rule_id: str, category: str) -> bool:
+    """Return True for PII rules where a synthetic cross-check adds no value."""
+    if category in _VERIFIER_SKIP_CATEGORIES:
+        return True
+    rid = rule_id.lower()
+    return any(rid.startswith(p) for p in _VERIFIER_SKIP_RULE_PREFIXES)
+
+
+# ── Deterministic synthetic string generators ─────────────────────────────
+
+def _rand_alphanum(n: int, seed: int) -> str:
+    """n uppercase letters + digits, reproducible from seed."""
+    chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    rng = _random_mod.Random(seed)
+    return "".join(rng.choice(chars) for _ in range(n))
+
+
+def _rand_lower(n: int, seed: int) -> str:
+    """n lowercase letters, reproducible from seed."""
+    chars = "abcdefghijklmnopqrstuvwxyz"
+    rng = _random_mod.Random(seed)
+    return "".join(rng.choice(chars) for _ in range(n))
+
+
+def _rand_digits(n: int, seed: int) -> str:
+    """n digit characters, reproducible from seed."""
+    rng = _random_mod.Random(seed)
+    return "".join(rng.choice("0123456789") for _ in range(n))
+
+
+def _rand_b64(n: int, seed: int) -> str:
+    """n base64 characters [A-Za-z0-9+/], reproducible from seed."""
+    chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    rng = _random_mod.Random(seed)
+    return "".join(rng.choice(chars) for _ in range(n))
+
+
+def _rand_mixed(n: int, seed: int) -> str:
+    """n mixed-case letters + digits, reproducible from seed."""
+    chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    rng = _random_mod.Random(seed)
+    return "".join(rng.choice(chars) for _ in range(n))
+
+
+def _generate_synthetic(rule_id: str, seed: int) -> tuple[str, str, str] | None:
+    """Return (synthetic, decoy1, decoy2) deterministic strings for rule_id.
+
+    Returns None for PII rules where cross-check adds no value.
+    The synthetic looks like the rule would match it; decoys are obviously benign.
+    All strings are freshly generated from rule_id + seed — zero info about the
+    original blocked string.
+    """
+    rid = rule_id.lower()
+
+    # PII rules — skip
+    if any(rid.startswith(p) for p in _VERIFIER_SKIP_RULE_PREFIXES):
+        return None
+
+    if "aws" in rid:
+        synthetic = "AKIA" + _rand_alphanum(16, seed)
+        decoy1 = _rand_lower(20, seed + 1)
+        decoy2 = _rand_lower(20, seed + 2)
+
+    elif "github-pat" in rid or rid == "ghp" or "ghp" in rid:
+        synthetic = "ghp_" + _rand_alphanum(36, seed)
+        decoy1 = _rand_lower(20, seed + 1)
+        decoy2 = _rand_lower(20, seed + 2)
+
+    elif "stripe" in rid or "sk_live" in rid:
+        synthetic = "sk_live_" + _rand_alphanum(24, seed)
+        decoy1 = _rand_lower(20, seed + 1)
+        decoy2 = _rand_lower(20, seed + 2)
+
+    elif "slack" in rid or "xoxb" in rid:
+        part1 = _rand_digits(12, seed)
+        part2 = _rand_digits(13, seed + 1)
+        part3 = _rand_lower(12, seed + 2)
+        synthetic = f"xoxb-{part1}-{part2}-{part3}"
+        decoy1 = _rand_lower(20, seed + 3)
+        decoy2 = _rand_lower(20, seed + 4)
+
+    elif "jwt" in rid or "eyj" in rid:
+        synthetic = "eyJhbGciOiJIUzI1NiJ9." + _rand_b64(32, seed) + "." + _rand_b64(32, seed + 1)
+        decoy1 = _rand_lower(20, seed + 2)
+        decoy2 = _rand_lower(20, seed + 3)
+
+    elif "fuzzy" in rid:
+        synthetic = "ORG:" + _rand_mixed(20, seed)
+        decoy1 = _rand_lower(20, seed + 1)
+        decoy2 = _rand_lower(20, seed + 2)
+
+    elif "entropy" in rid or "high-entropy" in rid:
+        synthetic = _rand_b64(32, seed)
+        decoy1 = _rand_lower(20, seed + 1)
+        decoy2 = _rand_lower(20, seed + 2)
+
+    else:
+        # Default: base64-shaped synthetic + lower-case decoys
+        synthetic = _rand_b64(28, seed)
+        decoy1 = _rand_b64(28, seed + 1)
+        decoy2 = _rand_b64(28, seed + 2)
+
+    return synthetic, decoy1, decoy2
+
+
+def _verifier_id() -> str:
+    """Generate a unique correlation ID: lg-<timestamp>-<4hex>."""
+    ts = int(time.time())
+    suffix = _rand_alphanum(4, ts ^ id(object())).lower()
+    return f"lg-{ts}-{suffix}"
+
+
+def _maybe_emit_verifier_notice(rule_id: str, category: str) -> str:
+    """If verifier is enabled and rule is not PII-skip, log pending verification
+    and return a one-line notice string. Returns empty string otherwise."""
+    try:
+        if not verifier_enabled():
+            return ""
+        if _verifier_skip_rule(rule_id, category):
+            return ""
+        vid = _verifier_id()
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        entry = {
+            "id": vid,
+            "ts": ts,
+            "rule_id": rule_id,
+            "category": category,
+            "shape": rule_id,
+            "verdict": None,
+        }
+        ensure_state_dir()
+        with PENDING_VERIFICATIONS.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+        return f"  \u21b3 [verifier] Cross-check available \u2014 run: scanner.py verify-emit {vid}"
+    except Exception:
+        return ""
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Hook handlers
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -915,11 +1084,16 @@ def hook_user_prompt() -> int:
     if definitive_secrets:
         # [allow-once] does NOT bypass definitive secret findings — block regardless.
         audit("block_user_prompt_secret", {"count": len(definitive_secrets)})
-        emit_prompt_block(
+        top_rule = definitive_secrets[0].rule_id
+        top_cat = definitive_secrets[0].category
+        notice = _maybe_emit_verifier_notice(top_rule, top_cat)
+        reason = (
             "leak-guard: secrets detected in your prompt. Please remove them before submitting.\n"
-            + format_summary(definitive_secrets),
-            silent=silent,
+            + format_summary(definitive_secrets)
         )
+        if notice:
+            reason += "\n" + notice
+        emit_prompt_block(reason, silent=silent)
         return 0
 
     # [allow-once] prefix: skip heuristic findings only (no definitive secrets above).
@@ -929,11 +1103,18 @@ def hook_user_prompt() -> int:
 
     if heuristic_findings:
         audit("ask_user_prompt_heuristic", {"count": len(heuristic_findings)})
-        emit_prompt_block(_ask_message(heuristic_findings), silent=silent)
+        top_rule = heuristic_findings[0].rule_id
+        top_cat = heuristic_findings[0].category
+        notice = _maybe_emit_verifier_notice(top_rule, top_cat)
+        msg = _ask_message(heuristic_findings)
+        if notice:
+            msg += "\n" + notice
+        emit_prompt_block(msg, silent=silent)
         return 0
 
     if definitive_pii:
         audit("block_user_prompt_pii", {"count": len(definitive_pii)})
+        # PII rules are skipped by verifier (pattern-based, no useful synthetic)
         emit_prompt_block(
             "leak-guard: PII detected in your prompt. Rephrase, redact, or add to allowlist "
             f"(~/.claude/leak-guard/allowlist.toml).\n{format_summary(definitive_pii)}",
@@ -975,11 +1156,11 @@ def hook_pre_tool() -> int:
             secrets, pii = classify(findings)
             if secrets:
                 audit("deny_pre_tool_secret", {"tool": tool, "count": len(secrets)})
-                emit_pre_tool(
-                    "deny",
-                    f"leak-guard: secrets in {tool} input — blocked.\n{format_summary(secrets)}",
-                    silent=silent,
-                )
+                notice = _maybe_emit_verifier_notice(secrets[0].rule_id, secrets[0].category)
+                reason = f"leak-guard: secrets in {tool} input — blocked.\n{format_summary(secrets)}"
+                if notice:
+                    reason += "\n" + notice
+                emit_pre_tool("deny", reason, silent=silent)
                 return 0
             if pii:
                 audit("ask_pre_tool_pii", {"tool": tool, "count": len(pii)})
@@ -1040,12 +1221,15 @@ def hook_post_tool() -> int:
     secrets, pii = classify(findings)
     if secrets:
         audit("block_post_tool_secret", {"tool": tool, "source": source, "count": len(secrets)})
-        emit_post_tool_block(
+        notice = _maybe_emit_verifier_notice(secrets[0].rule_id, secrets[0].category)
+        reason = (
             f"leak-guard BLOCKED {tool} output from {source}: secrets present. "
             f"Content withheld from context.\n{format_summary(secrets)}\n"
-            "Action: remove secrets from the source, add the path to allowlist, or scan explicitly with /scan-leaks.",
-            silent=silent,
+            "Action: remove secrets from the source, add the path to allowlist, or scan explicitly with /scan-leaks."
         )
+        if notice:
+            reason += "\n" + notice
+        emit_post_tool_block(reason, silent=silent)
         return 0
     if pii:
         audit("block_post_tool_pii", {"tool": tool, "source": source, "count": len(pii)})
@@ -1531,6 +1715,166 @@ def _strip_toml_array(raw: str, key: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Verifier CLI commands
+# ──────────────────────────────────────────────────────────────────────────
+
+def cmd_verifier(args) -> int:
+    """verifier <enable|disable|status> — manage the opt-in LLM cross-check."""
+    ensure_state_dir()
+    action = args.action
+
+    if action == "enable":
+        VERIFIER_CONFIG.write_text('verifier_enabled = true\n', encoding="utf-8")
+        print(
+            "Verifier enabled. When a block occurs, you'll see a one-line prompt suggestion.\n"
+            "Running it pastes a synthetic cross-check into your session — no real content is ever sent."
+        )
+        return 0
+
+    if action == "disable":
+        VERIFIER_CONFIG.write_text('verifier_enabled = false\n', encoding="utf-8")
+        print("Verifier disabled.")
+        return 0
+
+    if action == "status":
+        enabled = verifier_enabled()
+        print(f"Verifier is {'enabled' if enabled else 'disabled'}.")
+        pending = 0
+        if PENDING_VERIFICATIONS.exists():
+            try:
+                pending = sum(1 for line in PENDING_VERIFICATIONS.read_text().splitlines()
+                              if line.strip())
+            except Exception:
+                pass
+        print(f"Pending verifications: {pending}")
+        return 0
+
+    print(f"verifier: unknown action '{action}'. Use enable, disable, or status.", file=sys.stderr)
+    return 2
+
+
+def cmd_verify_emit(args) -> int:
+    """verify-emit <id> — print a synthetic cross-check prompt to stdout."""
+    vid = args.id
+
+    # Look up the pending verification entry
+    entry = None
+    if PENDING_VERIFICATIONS.exists():
+        try:
+            for line in PENDING_VERIFICATIONS.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if obj.get("id") == vid:
+                        entry = obj
+                        break
+                except json.JSONDecodeError:
+                    continue
+        except Exception:
+            pass
+
+    if entry is None:
+        print(
+            f"verify-emit: ID '{vid}' not found in pending verifications.\n"
+            "Check ~/.claude/leak-guard/pending_verifications.jsonl for available IDs.",
+            file=sys.stderr,
+        )
+        return 2
+
+    rule_id = entry.get("rule_id", "unknown")
+    category = entry.get("category", "secret")
+
+    # PII rules don't benefit from cross-check
+    if _verifier_skip_rule(rule_id, category):
+        print(
+            f"# leak-guard cross-check: rule '{rule_id}' is pattern-based PII.\n"
+            "# PII rules do not benefit from model cross-check — no synthetic needed."
+        )
+        return 0
+
+    # Generate deterministic seed from the ID string
+    seed = hash(vid) & 0x7FFFFFFF
+
+    result = _generate_synthetic(rule_id, seed)
+    if result is None:
+        print(
+            f"# leak-guard cross-check: rule '{rule_id}' is a PII rule.\n"
+            "# PII rules do not benefit from model cross-check."
+        )
+        return 0
+
+    synthetic, decoy1, decoy2 = result
+
+    print("# leak-guard cross-check (no real content — synthetics generated from rule shape only)")
+    print(f"# Correlation ID: {vid}  |  Rule: {rule_id}")
+    print()
+    print(f"[leak-guard cross-check {vid}]")
+    print("I need to classify these strings. Reply with exactly one word per line: SECRET or BENIGN.")
+    print("Do not explain. Strings:")
+    print(f"1. {synthetic}")
+    print(f"2. {decoy1}")
+    print(f"3. {decoy2}")
+    print(f"When done, run: scanner.py verify-ingest {vid} <your-answer-for-string-1>")
+    return 0
+
+
+def cmd_verify_ingest(args) -> int:
+    """verify-ingest <id> <verdict> — record model's verdict for a pending verification."""
+    vid = args.id
+    verdict = args.verdict.upper()
+    ingested_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    # Find and update the entry in pending_verifications.jsonl
+    entry = None
+    if PENDING_VERIFICATIONS.exists():
+        lines = []
+        try:
+            raw_lines = PENDING_VERIFICATIONS.read_text(encoding="utf-8").splitlines()
+            for line in raw_lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if obj.get("id") == vid:
+                        obj["verdict"] = verdict
+                        entry = obj
+                    lines.append(json.dumps(obj))
+                except json.JSONDecodeError:
+                    lines.append(line)
+            PENDING_VERIFICATIONS.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except Exception as e:
+            print(f"verify-ingest: could not update pending_verifications.jsonl: {e}", file=sys.stderr)
+            return 2
+
+    if entry is None:
+        print(f"verify-ingest: ID '{vid}' not found.", file=sys.stderr)
+        return 2
+
+    # Append to verifier_feedback.jsonl
+    ensure_state_dir()
+    feedback = {
+        "id": vid,
+        "ts": entry.get("ts", ""),
+        "rule_id": entry.get("rule_id", ""),
+        "verdict": verdict,
+        "shape": entry.get("shape", entry.get("rule_id", "")),
+        "ingested_at": ingested_at,
+    }
+    try:
+        with VERIFIER_FEEDBACK.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(feedback) + "\n")
+    except Exception as e:
+        print(f"verify-ingest: could not write feedback: {e}", file=sys.stderr)
+        return 2
+
+    print(f"Verdict recorded. Use `scanner.py --review` after the next pentest to act on it.")
+    return 0
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # main
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -1573,6 +1917,19 @@ def main(argv: list[str]) -> int:
     fp.add_argument("--reason", default="",
         help="Note explaining why this entry was added")
 
+    # verifier <enable|disable|status>
+    vp = sub.add_parser("verifier", help="Manage the opt-in LLM cross-check verifier")
+    vp.add_argument("action", choices=["enable", "disable", "status"])
+
+    # verify-emit <id>
+    ve = sub.add_parser("verify-emit", help="Emit a synthetic cross-check prompt for a pending verification")
+    ve.add_argument("id")
+
+    # verify-ingest <id> <verdict>
+    vi = sub.add_parser("verify-ingest", help="Record the model's verdict for a verification")
+    vi.add_argument("id")
+    vi.add_argument("verdict", choices=["SECRET", "BENIGN", "UNCERTAIN"])
+
     args = parser.parse_args(argv)
 
     try:
@@ -1597,6 +1954,12 @@ def main(argv: list[str]) -> int:
             return cmd_selftest()
         if args.cmd == "flag":
             return cmd_flag(args)
+        if args.cmd == "verifier":
+            return cmd_verifier(args)
+        if args.cmd == "verify-emit":
+            return cmd_verify_emit(args)
+        if args.cmd == "verify-ingest":
+            return cmd_verify_ingest(args)
     except Exception as e:
         audit("scanner_exception", {"cmd": args.cmd, "error": str(e), "tb": traceback.format_exc()[:2000]})
         # Fail-closed for hook events; pass-through for CLI
