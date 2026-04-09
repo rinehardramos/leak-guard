@@ -432,12 +432,16 @@ _STRIP_UNICODE_RE = re.compile(
     r'\u2066\u2067\u2068\u2069\ufeff]'
 )
 
+# leak-guard's own redaction preview tags — strip before re-scanning output.
+_REDACTED_TAG_RE = re.compile(r'\[REDACTED:[^\]]{1,120}\]')
+
 
 def _normalize_text(text: str) -> str:
-    """NFKC-normalize and strip bidi/zero-width control characters."""
+    """NFKC-normalize, strip bidi/zero-width controls, and remove redaction tags."""
     import unicodedata
     text = unicodedata.normalize('NFKC', text)
     text = _STRIP_UNICODE_RE.sub('', text)
+    text = _REDACTED_TAG_RE.sub('', text)
     return text
 
 
@@ -514,6 +518,9 @@ def scan_fuzzy_credentials(text: str, allow: Allowlist, source: str = "") -> lis
         if value in allow.literal:
             continue
         if _is_dummy_value(value):
+            continue
+        # Skip leak-guard's own redaction preview prefixes (e.g. REDACTED:...)
+        if prefix.upper() in {'REDACTED'}:
             continue
         # Require character-class diversity: plain uppercase words (e.g. "NOTE:")
         # and version strings (e.g. "V2:something") are excluded.
