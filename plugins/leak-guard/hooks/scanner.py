@@ -2075,6 +2075,21 @@ def cmd_selftest() -> int:
     else:
         check("proxy health endpoint", True, "proxy not running (skipped)")
 
+    # Training mode (author-only)
+    if _author_mode():
+        try:
+            _write_training_entry(
+                [Finding("selftest-rule", "secret", "<selftest>", 0,
+                         "[REDACTED:selftest:8ch:hash=00000000]",
+                         raw_match="selftest-dummy")],
+                session_id="selftest",
+            )
+            check("training log writable [author]", TRAINING_LOG.exists(), str(TRAINING_LOG))
+        except Exception as exc:
+            check("training log writable [author]", False, str(exc))
+    else:
+        check("training mode", True, "disabled (not author machine — expected for other users)")
+
     print(f"\n{'OK' if failures == 0 else 'FAILED'}: {failures} failure(s)")
     return 0 if failures == 0 else 1
 
@@ -2160,6 +2175,280 @@ def cmd_flag(args) -> int:
         return _append_custom_section("pattern", entry, reason)
 
     return 2
+
+
+_VALID_VERDICTS = {"fp", "fn", "unclear", "confirm"}
+
+_RULES_DIR = Path(os.environ.get(
+    "LEAK_GUARD_RULES_DIR",
+    Path(__file__).parent.parent / "rules",
+))
+
+_PROMOTE_CONFIDENCE_THRESHOLD = 0.75
+
+
+def cmd_train(args) -> int:
+    """Author-only training pipeline commands."""
+    if not _author_mode() and args.train_cmd not in ("list",):
+        print("train: requires LEAK_GUARD_AUTHOR=1 (author-only feature)", file=sys.stderr)
+        return 2
+    dispatch = {
+        "verdict":          lambda: _train_verdict(args.hash_prefix, args.verdict),
+        "list":             lambda: _train_list(getattr(args, "filter", "pending"),
+                                                getattr(args, "project", "")),
+        "analyze":          lambda: _train_analyze(),
+        "ingest-analysis":  lambda: _train_ingest_analysis(
+                                args.text if getattr(args, "text", None) else sys.stdin.read()),
+        "promote":          lambda: _train_promote(getattr(args, "dry_run", False)),
+    }
+    fn = dispatch.get(args.train_cmd)
+    if fn is None:
+        print(f"train: unknown subcommand '{args.train_cmd}'", file=sys.stderr)
+        return 2
+    return fn()
+
+
+def _train_verdict(hash_prefix: str, verdict: str) -> int:
+    if verdict not in _VALID_VERDICTS:
+        print(f"train verdict: must be one of {sorted(_VALID_VERDICTS)}", file=sys.stderr)
+        return 2
+    if not TRAINING_LOG.exists():
+        print("train verdict: no training_log.jsonl found — run the scanner first", file=sys.stderr)
+        return 1
+    entries, updated = [], 0
+    for line in TRAINING_LOG.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            entries.append(line)
+            continue
+        if e.get("hash", "").startswith(hash_prefix) and e.get("verdict") == "pending":
+            e["verdict"] = verdict
+            e["verdict_ts"] = time.time()
+            updated += 1
+        entries.append(json.dumps(e, default=str))
+    TRAINING_LOG.write_text("\n".join(entries) + "\n", encoding="utf-8")
+    print(f"train verdict: updated {updated} entry/entries to '{verdict}'")
+    audit("train_verdict", {"hash_prefix": hash_prefix, "verdict": verdict, "updated": updated})
+    return 0 if updated > 0 else 1
+
+
+def _train_list(filter_verdict: str = "pending", project: str = "") -> int:
+    if not TRAINING_LOG.exists():
+        print("train list: no training_log.jsonl found")
+        return 0
+    entries = []
+    for line in TRAINING_LOG.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    shown = [e for e in entries
+             if (filter_verdict == "all" or e.get("verdict") == filter_verdict)
+             and (not project or project in e.get("source", ""))]
+    if not shown:
+        print(f"train list: no entries with verdict='{filter_verdict}'" +
+              (f" project='{project}'" if project else ""))
+        return 0
+    print(f"{'#':<4} {'verdict':<10} {'analysis':<12} {'rule_id':<35} {'hash':<18} preview")
+    print("-" * 100)
+    for i, e in enumerate(shown):
+        ana = (e.get("analysis") or {}).get("category", "-") if e.get("analysis") else "-"
+        print(f"{i+1:<4} {e.get('verdict','?'):<10} {ana:<12} {e.get('rule_id','?'):<35} "
+              f"{e.get('hash','?')[:16]:<18} {e.get('preview','')}")
+    print(f"\n{len(shown)} entry/entries.")
+    return 0
+
+
+_ANALYSIS_RE = re.compile(
+    r"ANALYSIS:(?P<hash>[a-f0-9]+):category=(?P<category>secret|pii|benign)"
+    r":confidence=(?P<conf>[0-9.]+):reason=(?P<reason>.+)"
+)
+
+
+def _train_analyze() -> int:
+    """Emit additionalContext asking Claude to categorize pending/unclear/fn findings."""
+    if not TRAINING_LOG.exists():
+        print("train analyze: no training_log.jsonl found", file=sys.stderr)
+        return 1
+    candidates = []
+    for line in TRAINING_LOG.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if e.get("verdict") in ("pending", "unclear", "fn") and e.get("analysis") is None:
+            candidates.append(e)
+    if not candidates:
+        print("train analyze: no unanalyzed entries found")
+        return 0
+    lines = [
+        "SYSTEM NOTE (leak-guard training): Analyze each finding below.",
+        "For each, respond on ONE line exactly:",
+        "  ANALYSIS:<hash>:category=<secret|pii|benign>:confidence=<0.00-1.00>:reason=<one sentence>",
+        "",
+        "Rules:",
+        "- secret: any credential, token, API key, password, private key",
+        "- pii: personally identifiable info (email, SSN, phone) but not a credential",
+        "- benign: internal ID, UUID, hash, random string with no credential semantics",
+        "- confidence: 0.0=certainly benign, 1.0=certainly a real credential/PII leak",
+        "- Be conservative: weight toward real leak if ambiguous",
+        "",
+        "Findings to analyze:",
+    ]
+    for e in candidates[:20]:
+        lines.append(f"  hash={e['hash']} rule={e['rule_id']} preview={e['preview']} "
+                     f"user_verdict={e['verdict']}")
+    lines += [
+        "",
+        "After responding with ANALYSIS lines, run: scanner.py train ingest-analysis",
+    ]
+    ctx = "\n".join(lines)
+    out = {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": ctx}}
+    sys.stdout.write(json.dumps(out))
+    sys.stdout.flush()
+    audit("train_analyze", {"count": len(candidates)})
+    return 0
+
+
+def _train_ingest_analysis(text: str) -> int:
+    """Parse ANALYSIS lines from Claude's response and update training_log.jsonl."""
+    if not TRAINING_LOG.exists():
+        print("train ingest-analysis: no training_log.jsonl found", file=sys.stderr)
+        return 1
+    parsed = {}
+    for line in text.splitlines():
+        m = _ANALYSIS_RE.search(line.strip())
+        if m:
+            h = m.group("hash")
+            parsed[h] = {
+                "category": m.group("category"),
+                "confidence": float(m.group("conf")),
+                "reason": m.group("reason").strip(),
+                "analyzed_ts": time.time(),
+            }
+    if not parsed:
+        print("train ingest-analysis: no valid ANALYSIS lines found in input", file=sys.stderr)
+        return 1
+    entries, updated = [], 0
+    for line in TRAINING_LOG.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            entries.append(line)
+            continue
+        h = e.get("hash", "")
+        match = next((v for k, v in parsed.items() if h.startswith(k) or k.startswith(h)), None)
+        if match:
+            e["analysis"] = match
+            updated += 1
+        entries.append(json.dumps(e, default=str))
+    TRAINING_LOG.write_text("\n".join(entries) + "\n", encoding="utf-8")
+    print(f"train ingest-analysis: updated {updated} entry/entries with LLM analysis")
+    audit("train_ingest_analysis", {"parsed": len(parsed), "updated": updated})
+    return 0
+
+
+def _train_promote(dry_run: bool = False) -> int:
+    """Promote high-confidence findings into repo rules.
+
+    FN/unclear/confirm with confidence >= threshold → pii.toml candidate block.
+    FP with benign analysis → suppress_rules in allowlist.toml.
+    """
+    if not TRAINING_LOG.exists():
+        print("train promote: no training_log.jsonl found", file=sys.stderr)
+        return 1
+    fn_candidates, fp_candidates = [], []
+    entries_raw = []
+    for line in TRAINING_LOG.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            entries_raw.append(line)
+            continue
+        analysis = e.get("analysis") or {}
+        conf = float(analysis.get("confidence", 0.0))
+        cat = analysis.get("category", "")
+        verdict = e.get("verdict", "pending")
+        already_promoted = e.get("promoted", False)
+        if already_promoted or conf < _PROMOTE_CONFIDENCE_THRESHOLD:
+            entries_raw.append(json.dumps(e, default=str))
+            continue
+        if verdict == "fp" and cat == "benign":
+            fp_candidates.append(e)
+            e["promoted"] = True
+        elif verdict in ("fn", "unclear", "confirm") and cat in ("secret", "pii"):
+            fn_candidates.append(e)
+            e["promoted"] = True
+        entries_raw.append(json.dumps(e, default=str))
+
+    if not fn_candidates and not fp_candidates:
+        print(f"train promote: no high-confidence candidates "
+              f"(threshold={_PROMOTE_CONFIDENCE_THRESHOLD})")
+        return 0
+
+    if fn_candidates:
+        pii_toml = _RULES_DIR / "pii.toml"
+        block_lines = [f"\n# --- training-promoted candidates ({time.strftime('%Y-%m-%d')}) ---"]
+        for e in fn_candidates:
+            ana = e.get("analysis", {})
+            block_lines += [
+                f"# rule_id: {e['rule_id']}  confidence: {ana.get('confidence')}",
+                f"# reason: {ana.get('reason', '')}",
+                f"# preview: {e['preview']}",
+                f"# TODO: add regex pattern below",
+                f"# [[pattern]]",
+                f"# rule_id = \"{e['rule_id']}\"",
+                f"# regex = \"FILL_IN_PATTERN\"",
+                f"# description = \"{ana.get('reason', '')}\"",
+                f"# severity = \"{e['severity']}\"",
+                "",
+            ]
+            print(f"  [FN→pii.toml] {e['rule_id']} (confidence={ana.get('confidence')})")
+        if not dry_run:
+            with pii_toml.open("a", encoding="utf-8") as f:
+                f.write("\n".join(block_lines))
+
+    if fp_candidates:
+        allowlist_toml = _RULES_DIR / "allowlist.toml"
+        fp_lines = [f"\n# training-promoted FP suppressions ({time.strftime('%Y-%m-%d')})"]
+        fp_lines.append("[suppress_rules]")
+        for e in fp_candidates:
+            ana = e.get("analysis", {})
+            fp_lines += [
+                f"# confidence={ana.get('confidence')} reason={ana.get('reason', '')}",
+                f"{e['rule_id']} = true",
+                "",
+            ]
+            print(f"  [FP→allowlist.toml] {e['rule_id']} (confidence={ana.get('confidence')})")
+        if not dry_run:
+            with allowlist_toml.open("a", encoding="utf-8") as f:
+                f.write("\n".join(fp_lines))
+
+    if not dry_run:
+        TRAINING_LOG.write_text("\n".join(entries_raw) + "\n", encoding="utf-8")
+        print(f"\ntrain promote: {len(fn_candidates)} FN + {len(fp_candidates)} FP promoted.")
+        print("Review rule files, fill in TODO patterns, then commit and push.")
+        audit("train_promote", {"fn": len(fn_candidates), "fp": len(fp_candidates)})
+    else:
+        print(f"\ntrain promote --dry-run: would promote "
+              f"{len(fn_candidates)} FN + {len(fp_candidates)} FP.")
+    return 0
 
 
 def _append_literal(literal: str, reason: str) -> int:
@@ -2442,6 +2731,27 @@ def main(argv: list[str]) -> int:
     sub.add_parser("git-hook-pre-push")
     sub.add_parser("selftest")
 
+    # `train` — author-only training pipeline
+    tp = sub.add_parser("train", help="[author] Training pipeline: verdict/list/analyze/promote")
+    train_sub = tp.add_subparsers(dest="train_cmd", required=True)
+
+    tv = train_sub.add_parser("verdict", help="Label a finding by hash prefix")
+    tv.add_argument("hash_prefix")
+    tv.add_argument("verdict", choices=sorted(_VALID_VERDICTS))
+
+    tl = train_sub.add_parser("list", help="List training log entries")
+    tl.add_argument("--filter", choices=["pending", "fp", "fn", "unclear", "confirm", "all"],
+                    default="pending")
+    tl.add_argument("--project", default="", help="Filter by source project name substring")
+
+    train_sub.add_parser("analyze", help="Emit LLM prompt to categorize unanalyzed findings")
+
+    ia = train_sub.add_parser("ingest-analysis", help="Record Claude's ANALYSIS responses")
+    ia.add_argument("--text", default=None, help="ANALYSIS text (reads stdin if omitted)")
+
+    tpr = train_sub.add_parser("promote", help="Promote high-confidence findings into repo rules")
+    tpr.add_argument("--dry-run", action="store_true")
+
     # `flag` — user feedback loop: append allowlist / custom-rule entries so
     # leak-guard learns from FP/FN/uncertain verdicts (see `tests/adversarial_suite.py`).
     fp = sub.add_parser("flag",
@@ -2504,6 +2814,8 @@ def main(argv: list[str]) -> int:
             return cmd_git_hook_pre_push()
         if args.cmd == "selftest":
             return cmd_selftest()
+        if args.cmd == "train":
+            return cmd_train(args)
         if args.cmd == "flag":
             return cmd_flag(args)
         if args.cmd == "verifier":

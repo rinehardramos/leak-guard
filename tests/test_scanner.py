@@ -801,3 +801,98 @@ class TestTrainingMode:
         assert "raw_match" not in e
         assert "ts" in e
         assert "session_id" in e
+
+    def test_verdict_updates_pending_entry(self, tmp_path):
+        log = tmp_path / "training_log.jsonl"
+        fake_hash = "abcd1234efgh5678"
+        entry = {"ts": 1000.0, "session_id": "s1", "verdict": "pending", "analysis": None,
+                 "rule_id": "fuzzy-prefixed-credential", "category": "secret",
+                 "severity": "high", "hash": fake_hash,
+                 "preview": "[REDACTED:fuzzy:8ch:hash=abcd1234]", "source": "<test>"}
+        log.write_text(json.dumps(entry) + "\n")
+        env = {**os.environ, "LEAK_GUARD_STATE_DIR": str(tmp_path), "LEAK_GUARD_AUTHOR": "1"}
+        r = subprocess.run(
+            [sys.executable, str(SCANNER), "train", "verdict", fake_hash, "fp"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 0, r.stderr
+        updated = [json.loads(l) for l in log.read_text().splitlines() if l.strip()]
+        assert updated[0]["verdict"] == "fp"
+        assert "verdict_ts" in updated[0]
+
+    def test_list_filters_by_verdict(self, tmp_path):
+        log = tmp_path / "training_log.jsonl"
+        entries = [
+            {"ts": 1000.0, "verdict": "pending", "rule_id": "fuzzy-prefixed-credential",
+             "hash": "aabbcc11", "preview": "[REDACTED:8ch]", "source": "<test>",
+             "session_id": "s1", "analysis": None},
+            {"ts": 2000.0, "verdict": "fp", "rule_id": "email",
+             "hash": "ddeeff22", "preview": "a@b.com", "source": "<test>",
+             "session_id": "s2", "analysis": None},
+        ]
+        log.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        env = {**os.environ, "LEAK_GUARD_STATE_DIR": str(tmp_path)}
+        r = subprocess.run(
+            [sys.executable, str(SCANNER), "train", "list", "--filter", "pending"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 0
+        assert "aabbcc11" in r.stdout
+        assert "ddeeff22" not in r.stdout
+
+    def test_promote_fn_writes_to_pii_toml(self, tmp_path):
+        """High-confidence FN entries are promoted as pii.toml candidate blocks."""
+        rules_dir = tmp_path / "rules"
+        rules_dir.mkdir()
+        (rules_dir / "pii.toml").write_text("# patterns\n")
+        (rules_dir / "allowlist.toml").write_text("[suppress_rules]\n")
+
+        log = tmp_path / "training_log.jsonl"
+        entry = {
+            "ts": 1000.0, "verdict": "fn", "session_id": "s1",
+            "rule_id": "my-custom-prefix", "category": "secret", "severity": "high",
+            "hash": "aabb1122ccdd3344", "preview": "[REDACTED:12ch:hash=aabb1122]",
+            "source": "<test>", "promoted": False,
+            "analysis": {"category": "secret", "confidence": 0.9,
+                         "reason": "looks like an internal API key format",
+                         "analyzed_ts": 1000.0},
+        }
+        log.write_text(json.dumps(entry) + "\n")
+        env = {**os.environ, "LEAK_GUARD_STATE_DIR": str(tmp_path),
+               "LEAK_GUARD_AUTHOR": "1", "LEAK_GUARD_RULES_DIR": str(rules_dir)}
+        r = subprocess.run(
+            [sys.executable, str(SCANNER), "train", "promote"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 0, r.stderr
+        assert "my-custom-prefix" in r.stdout
+        updated = [json.loads(l) for l in log.read_text().splitlines() if l.strip()]
+        assert updated[0].get("promoted") is True
+
+    def test_promote_fp_writes_to_allowlist(self, tmp_path):
+        """High-confidence FP entries are promoted as suppress_rules."""
+        rules_dir = tmp_path / "rules"
+        rules_dir.mkdir()
+        (rules_dir / "allowlist.toml").write_text("[suppress_rules]\n")
+        (rules_dir / "pii.toml").write_text("")
+
+        log = tmp_path / "training_log.jsonl"
+        entry = {
+            "ts": 1000.0, "verdict": "fp", "session_id": "s1",
+            "rule_id": "high-entropy-base64", "category": "secret", "severity": "high",
+            "hash": "ccdd3344eeff5566", "preview": "[REDACTED:10ch:hash=ccdd3344]",
+            "source": "<test>", "promoted": False,
+            "analysis": {"category": "benign", "confidence": 0.85,
+                         "reason": "internal session token, not a user secret",
+                         "analyzed_ts": 1000.0},
+        }
+        log.write_text(json.dumps(entry) + "\n")
+        env = {**os.environ, "LEAK_GUARD_STATE_DIR": str(tmp_path),
+               "LEAK_GUARD_AUTHOR": "1", "LEAK_GUARD_RULES_DIR": str(rules_dir)}
+        r = subprocess.run(
+            [sys.executable, str(SCANNER), "train", "promote"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 0, r.stderr
+        allowlist = (rules_dir / "allowlist.toml").read_text()
+        assert "high-entropy-base64" in allowlist
