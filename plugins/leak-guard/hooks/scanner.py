@@ -1904,7 +1904,67 @@ def cmd_selftest() -> int:
         if not ok:
             failures += 1
 
-    print("leak-guard selftest")
+    def warn(name: str, ok: bool, detail: str = ""):
+        """Like check() but a failure is a warning only — does not increment failures."""
+        status = "PASS" if ok else "WARN"
+        print(f"  [{status}] {name}" + (f" — {detail}" if detail else ""))
+
+    print("leak-guard selftest — fresh-install + functional checks")
+
+    # 0. Fresh-install validation
+    import sys as _sys, os as _os
+
+    # Python version >= 3.9
+    _ver = _sys.version_info
+    check("python >= 3.9", _ver >= (3, 9), f"found {_ver.major}.{_ver.minor}")
+
+    # State dir is creatable (or already exists) with correct mode
+    _state_dir = STATE_DIR
+    try:
+        _state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _mode = oct(_state_dir.stat().st_mode)[-3:]
+        check("state dir exists", True, str(_state_dir))
+        if _os.name != "nt":
+            check("state dir mode 700", _mode == "700", f"mode={_mode}")
+    except Exception as _exc:
+        check("state dir creatable", False, str(_exc))
+
+    # Rules dir exists (relative to scanner.py)
+    _rules_dir = Path(__file__).parent.parent / "rules"
+    check("rules dir present", _rules_dir.is_dir(), str(_rules_dir))
+
+    # allowlist.toml: default loads cleanly even when absent
+    try:
+        _al = load_allowlist()
+        check("allowlist loads when absent", True, "default allowlist ok")
+    except Exception as _exc:
+        check("allowlist loads when absent", False, str(_exc))
+
+    # Hook JSON I/O round-trip
+    import json as _json
+    import subprocess as _sp
+    _fake_event = {"hook_event_name": "UserPromptSubmit", "prompt": "hello world", "session_id": "selftest"}
+    try:
+        _r = _sp.run([_sys.executable, __file__, "hook-user-prompt"],
+            input=_json.dumps(_fake_event), capture_output=True, text=True, timeout=10)
+        check("hook JSON round-trip (clean prompt)", _r.returncode == 0, f"rc={_r.returncode}")
+    except Exception as _exc:
+        check("hook JSON round-trip (clean prompt)", False, str(_exc))
+
+    # Hook correctly redacts a known fake credential
+    # String is built at runtime to avoid triggering the scanner on source literals.
+    _fake_cred_prompt = "my key " + "CSKC:" + "ScdsJCCKLSLKDKLCNLKCEINK2233as"
+    _fake_cred_event = {"hook_event_name": "UserPromptSubmit", "prompt": _fake_cred_prompt, "session_id": "selftest"}
+    try:
+        _r2 = _sp.run([_sys.executable, __file__, "hook-user-prompt"],
+            input=_json.dumps(_fake_cred_event), capture_output=True, text=True, timeout=10)
+        _out = _json.loads(_r2.stdout) if _r2.stdout.strip() else {}
+        _ctx = _out.get("hookSpecificOutput", {}).get("additionalContext", "")
+        check("hook redacts credential", _r2.returncode == 0 and "leak-guard" in _ctx and "[REDACTED]" in _ctx,
+              f"rc={_r2.returncode} ctx_len={len(_ctx)}")
+    except Exception as _exc:
+        check("hook redacts credential", False, str(_exc))
+
     # 1. Rule loading
     pii_rules = load_pii_rules()
     check("pii rules load", len(pii_rules) > 0, f"{len(pii_rules)} rules")
@@ -1932,14 +1992,13 @@ def cmd_selftest() -> int:
     f = scan_filename("/tmp/id_rsa", load_filename_blocklist())
     check("filename id_rsa blocked", len(f) > 0)
 
-    # 7. gitleaks available
-    check("gitleaks installed", find_gitleaks() is not None,
-          find_gitleaks() or "MISSING — brew install gitleaks")
+    # 7. gitleaks available (optional — WARN not FAIL when absent)
+    warn("gitleaks installed", find_gitleaks() is not None,
+         find_gitleaks() or "not found — install for deep secret scanning (brew install gitleaks)")
 
-    # 8. gitleaks catches AWS key (use a structurally valid fake, not the canonical
-    #    AKIAIOSFODNN7EXAMPLE which gitleaks allowlists internally)
+    # 8. gitleaks catches a structurally valid fake key — only runs when present
     if find_gitleaks():
-        fake = 'AWS_ACCESS_KEY_ID=AKIAY3FDSNDKFKSIDJSW\n'
+        fake = "AWS_ACCESS_KEY_ID=" + "AKIAY3FDS" + "NDKFKSIDJSW\n"
         f = scan_secrets_gitleaks(text=fake, source_label="<test>")
         check("gitleaks detects AWS key", len(f) > 0, f"found {len(f)}")
 
