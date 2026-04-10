@@ -1324,43 +1324,34 @@ def hook_user_prompt() -> int:
     heuristic_findings = [f for f in secrets + pii if f.rule_id in _HEURISTIC_RULE_IDS]
     definitive_pii = [f for f in pii if f.rule_id not in _HEURISTIC_RULE_IDS]
 
-    if definitive_secrets:
-        # [allow-once] does NOT bypass definitive secret findings.
-        audit("block_user_prompt_secret", {"count": len(definitive_secrets)})
-        top_rule = definitive_secrets[0].rule_id
-        top_cat = definitive_secrets[0].category
-        _maybe_emit_verifier_notice(top_rule, top_cat)
-        _write_pending_action(prompt, definitive_secrets)
-        menu = _build_menu_text(definitive_secrets)
-        # Exit 0 + updatedUserPrompt: replaces the secret-bearing prompt with the
-        # menu question.  Claude renders it visibly in the chat UI.  The original
-        # prompt (with the secret) is stored in pending_action.json only — it never
-        # reaches the model.
-        emit_menu_prompt(menu)
+    if not findings:
         return 0
 
-    # [allow-once] prefix: skip heuristic findings only (no definitive secrets above).
+    # [allow-once] prefix bypasses all findings.
     if allow_once:
         audit("allow_once_bypass", {})
-        return 0  # let the prompt through unchanged
-
-    if heuristic_findings:
-        audit("ask_user_prompt_heuristic", {"count": len(heuristic_findings)})
-        top_rule = heuristic_findings[0].rule_id
-        top_cat = heuristic_findings[0].category
-        _maybe_emit_verifier_notice(top_rule, top_cat)
-        _write_pending_action(prompt, heuristic_findings)
-        menu = _build_menu_text(heuristic_findings)
-        emit_menu_prompt(menu)
         return 0
 
-    if definitive_pii:
-        audit("block_user_prompt_pii", {"count": len(definitive_pii)})
-        _write_pending_action(prompt, definitive_pii)
-        menu = _build_menu_text(definitive_pii)
-        emit_menu_prompt(menu)
-        return 0
+    # Redact detected values from the prompt text.
+    redacted_prompt = prompt
+    for f in findings:
+        if f.raw_match:
+            redacted_prompt = redacted_prompt.replace(f.raw_match, "[REDACTED]")
 
+    audit("redact_user_prompt", {"count": len(findings)})
+    summary = format_summary(findings)
+
+    context = (
+        "SYSTEM NOTE (leak-guard): The user's message contained potential secrets or PII "
+        "that have been flagged. The sensitive values are shown as [REDACTED] below.\n\n"
+        f"Findings:\n{summary}\n\n"
+        f"Redacted message:\n{redacted_prompt}\n\n"
+        "Instructions: (1) Respond to the redacted message as the user's actual request. "
+        "(2) Begin your response by briefly informing the user that leak-guard detected and "
+        "redacted sensitive content from their prompt, naming what was found. "
+        "(3) Do not reproduce or guess the redacted values."
+    )
+    emit_menu_prompt(context)
     return 0
 
 

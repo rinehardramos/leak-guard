@@ -243,25 +243,26 @@ class TestHookUserPrompt:
             assert out.get("decision") != "block"
 
     def test_secret_in_prompt_intercepted(self):
-        """Secret prompt replaced with action picker menu via additionalContext."""
+        """Secret prompt: hook redacts value and injects SYSTEM NOTE via additionalContext."""
         rc, out, _ = run_hook(
             "hook-user-prompt",
             self._event(f"My AWS key is {_AWS}, help me use it"),
         )
         assert rc == 0
         ctx = (out or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
-        assert "Allow" in ctx
+        assert "leak-guard" in ctx
+        assert "[REDACTED]" in ctx
         assert _AWS not in ctx
 
     def test_pii_in_prompt_intercepted(self):
-        """PII prompt replaced with action picker menu via additionalContext."""
+        """PII prompt: hook redacts value and injects SYSTEM NOTE via additionalContext."""
         rc, out, _ = run_hook(
             "hook-user-prompt",
             self._event("My SSN is 123-45-6789, is it safe?"),
         )
         assert rc == 0
         ctx = (out or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
-        assert "Allow" in ctx
+        assert "leak-guard" in ctx
         assert "123-45-6789" not in ctx
 
 
@@ -492,7 +493,7 @@ class TestFuzzyCredentials:
             assert self._CRED not in h.preview
 
     def test_hook_intercepts_original_prompt(self):
-        """Hook replaces credential prompt with action picker menu via additionalContext."""
+        """Hook redacts credential and injects SYSTEM NOTE via additionalContext."""
         rc, out, _ = run_hook(
             "hook-user-prompt",
             {
@@ -503,7 +504,7 @@ class TestFuzzyCredentials:
         )
         assert rc == 0
         ctx = (out or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
-        assert "Allow" in ctx
+        assert "leak-guard" in ctx
         assert self._CRED not in ctx
 
 
@@ -605,8 +606,8 @@ class TestDummyValues:
 
     # ── Allow-once scoping (C02) ─────────────────────────────────────────────
 
-    def test_allow_once_does_not_bypass_definitive_secret(self):
-        """C02: [allow-once] must NOT auto-allow definitive secrets — menu is shown instead."""
+    def test_allow_once_bypasses_all_findings(self):
+        """[allow-once] prefix bypasses all findings including definitive secrets — prompt sent as-is."""
         aws = "AKIA" + "Y3FDSNDKFK" + "SIDJSW"
         rc, out, _ = run_hook(
             "hook-user-prompt",
@@ -615,9 +616,8 @@ class TestDummyValues:
              "session_id": "test"},
         )
         assert rc == 0
-        ctx = (out or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
-        assert "Allow" in ctx, "C02 regression: definitive secret must show menu even with [allow-once]"
-        assert aws not in ctx, "C02 regression: secret must not appear in menu"
+        ctx = (out or {}).get("hookSpecificOutput", {}).get("additionalContext", "") if out else ""
+        assert "leak-guard" not in ctx, "[allow-once] should bypass redaction entirely"
 
 
 class TestSelftest:
@@ -688,25 +688,16 @@ class TestPromptInjectedPicker:
 
     _CRED = "ScdsJCCKLSLKDKLCNLKCEINK2233as"
 
-    def test_detection_writes_pending_and_shows_menu(self, tmp_path):
-        """Turn 1: detection writes pending_action.json and injects menu via additionalContext."""
+    def test_detection_redacts_and_notifies(self, tmp_path):
+        """Detection: hook redacts credential inline and injects SYSTEM NOTE via additionalContext."""
         state = tmp_path / "state"
         state.mkdir(mode=0o700)
         rc, out, _ = _run_hook_with_state(state, f"here is my new pass CSKC:{self._CRED}")
         assert rc == 0
         ctx = (out or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
-        assert "Allow" in ctx and "Redact" in ctx
+        assert "leak-guard" in ctx
+        assert "[REDACTED]" in ctx
         assert self._CRED not in ctx
-        pending_file = state / "pending_action.json"
-        assert pending_file.exists(), "pending_action.json should have been written"
-        data = json.loads(pending_file.read_text())
-        assert "prompt" in data
-        assert "redact_targets" in data
-        assert "findings_summary" in data
-        assert "expires_at" in data
-        # findings_summary must not contain raw_match
-        for fs in data["findings_summary"]:
-            assert self._CRED not in str(fs.get("preview", ""))
 
     def test_choice_allow_resends_original(self, tmp_path):
         """Turn 2 A: exits 0 and emits updatedUserPrompt == original."""
@@ -762,13 +753,13 @@ class TestPromptInjectedPicker:
         updated = (out or {}).get("hookSpecificOutput", {}).get("updatedUserPrompt")
         assert updated is None
 
-    def test_menu_in_additional_context(self, tmp_path):
-        """Turn 1: menu injected via additionalContext (correct UserPromptSubmit field)."""
+    def test_redaction_in_additional_context(self, tmp_path):
+        """Detection: SYSTEM NOTE with redacted prompt injected via additionalContext."""
         state = tmp_path / "state"
         state.mkdir(mode=0o700)
         rc, out, _ = _run_hook_with_state(state, f"here is my new pass CSKC:{self._CRED}")
         assert rc == 0
         ctx = (out or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
-        assert "Allow" in ctx
-        assert "Redact" in ctx
-        assert "Discard" in ctx
+        assert "leak-guard" in ctx
+        assert "[REDACTED]" in ctx
+        assert self._CRED not in ctx
