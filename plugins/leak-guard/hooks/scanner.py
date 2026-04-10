@@ -435,13 +435,22 @@ _STRIP_UNICODE_RE = re.compile(
 # leak-guard's own redaction preview tags — strip before re-scanning output.
 _REDACTED_TAG_RE = re.compile(r'\[REDACTED:[^\]]{1,120}\]')
 
+# Claude Code runtime XML blocks injected into prompts — never contain user secrets.
+# Covers: <task-notification>, <command-output>, <local-command-stdout>, etc.
+_RUNTIME_XML_RE = re.compile(
+    r'<(task-notification|command-output|local-command-stdout|system-reminder|antml:[^>]+)'
+    r'[\s\S]*?</\1>',
+    re.DOTALL,
+)
+
 
 def _normalize_text(text: str) -> str:
-    """NFKC-normalize, strip bidi/zero-width controls, and remove redaction tags."""
+    """NFKC-normalize, strip bidi/zero-width controls, redaction tags, and runtime XML blocks."""
     import unicodedata
     text = unicodedata.normalize('NFKC', text)
     text = _STRIP_UNICODE_RE.sub('', text)
     text = _REDACTED_TAG_RE.sub('', text)
+    text = _RUNTIME_XML_RE.sub('', text)
     return text
 
 
