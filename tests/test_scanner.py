@@ -763,3 +763,41 @@ class TestPromptInjectedPicker:
         assert "leak-guard" in ctx
         assert "[REDACTED]" in ctx
         assert self._CRED not in ctx
+
+class TestTrainingMode:
+    def test_capture_skipped_without_author_flag(self, tmp_path):
+        """Without LEAK_GUARD_AUTHOR=1, no training_log.jsonl is written."""
+        cred = "CSKC:Scds" + "JCCKLSLKDKLCNLKCEINK2233as"
+        env = {k: v for k, v in os.environ.items() if k != "LEAK_GUARD_AUTHOR"}
+        env["LEAK_GUARD_STATE_DIR"] = str(tmp_path)
+        r = subprocess.run(
+            [sys.executable, str(SCANNER), "hook-user-prompt"],
+            input=json.dumps({"hook_event_name": "UserPromptSubmit",
+                              "prompt": f"my key {cred}",
+                              "session_id": "train-test"}),
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        log = tmp_path / "training_log.jsonl"
+        assert not log.exists(), "training_log.jsonl must NOT be written without LEAK_GUARD_AUTHOR=1"
+
+    def test_capture_written_with_author_flag(self, tmp_path):
+        """With LEAK_GUARD_AUTHOR=1, training_log.jsonl is written per finding."""
+        cred = "CSKC:Scds" + "JCCKLSLKDKLCNLKCEINK2233as"
+        env = {**os.environ, "LEAK_GUARD_STATE_DIR": str(tmp_path), "LEAK_GUARD_AUTHOR": "1"}
+        r = subprocess.run(
+            [sys.executable, str(SCANNER), "hook-user-prompt"],
+            input=json.dumps({"hook_event_name": "UserPromptSubmit",
+                              "prompt": f"my key {cred}",
+                              "session_id": "train-test"}),
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        log = tmp_path / "training_log.jsonl"
+        assert log.exists(), "training_log.jsonl should be written when LEAK_GUARD_AUTHOR=1"
+        entries = [json.loads(l) for l in log.read_text().splitlines() if l.strip()]
+        assert len(entries) >= 1
+        e = entries[0]
+        assert e["verdict"] == "pending"
+        assert "hash" in e
+        assert "raw_match" not in e
+        assert "ts" in e
+        assert "session_id" in e

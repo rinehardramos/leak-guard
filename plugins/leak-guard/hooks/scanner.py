@@ -54,6 +54,7 @@ GIT_HOOKS_DIR = PLUGIN_ROOT / "git-hooks"
 
 STATE_DIR = Path(os.environ.get("LEAK_GUARD_STATE_DIR", Path.home() / ".claude" / "leak-guard"))
 AUDIT_LOG = STATE_DIR / "audit.log"
+TRAINING_LOG = STATE_DIR / "training_log.jsonl"
 USER_ALLOWLIST = STATE_DIR / "allowlist.toml"
 CUSTOM_RULES_FILE = STATE_DIR / "custom_rules.toml"
 
@@ -132,6 +133,14 @@ def ensure_state_dir() -> None:
         AUDIT_LOG.chmod(0o600)
 
 
+def _author_mode() -> bool:
+    """True only on the author's machine — gated by LEAK_GUARD_AUTHOR=1 env var.
+    Set in ~/.zshrc: export LEAK_GUARD_AUTHOR=1
+    Other users never have this set, so training capture is a no-op for them.
+    """
+    return os.environ.get("LEAK_GUARD_AUTHOR") == "1"
+
+
 def audit(event: str, payload: dict[str, Any]) -> None:
     """Append one JSON line to audit log. Never raises."""
     try:
@@ -139,6 +148,34 @@ def audit(event: str, payload: dict[str, Any]) -> None:
         entry = {"ts": time.time(), "event": event, **payload}
         with AUDIT_LOG.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def _write_training_entry(findings: list, session_id: str = "") -> None:
+    """Author-only: append one JSONL line per finding. No raw values stored."""
+    if not _author_mode():
+        return
+    try:
+        ensure_state_dir()
+        ts = time.time()
+        lines = []
+        for f in findings:
+            entry = {
+                "ts": ts,
+                "session_id": session_id,
+                "verdict": "pending",
+                "analysis": None,
+                "rule_id": f.rule_id,
+                "category": f.category,
+                "severity": f.severity,
+                "hash": sha256(f.raw_match) if f.raw_match else "",
+                "preview": f.preview,
+                "source": f.source,
+            }
+            lines.append(json.dumps(entry, default=str))
+        with TRAINING_LOG.open("a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
     except Exception:
         pass
 
@@ -1312,6 +1349,7 @@ def _ask_message(findings: list[Finding]) -> str:
 def hook_user_prompt() -> int:
     event = read_event()
     prompt = event.get("prompt", "") or ""
+    session_id = event.get("session_id", "")
 
     # ── Turn 2: check if this is a reply to the action picker menu ────────────
     choice = _is_choice_reply(prompt)
@@ -1348,6 +1386,7 @@ def hook_user_prompt() -> int:
             redacted_prompt = redacted_prompt.replace(f.raw_match, "[REDACTED]")
 
     audit("redact_user_prompt", {"count": len(findings)})
+    _write_training_entry(findings, session_id=session_id)
     summary = format_summary(findings)
 
     context = (
