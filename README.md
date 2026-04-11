@@ -1,8 +1,8 @@
 # leak-guard
 
-> Local-first PII & secret scanner for Claude Code. Blocks leaks **before they reach the model or a git remote.**
+> Local-first PII & secret scanner for Claude Code. Redacts leaks before they reach the model.
 
-[![Version](https://img.shields.io/badge/version-0.1.0-blue)](https://github.com/rinehardramos/leak-guard)
+[![Version](https://img.shields.io/badge/version-0.3.0-blue)](https://github.com/rinehardramos/leak-guard)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Claude Code Plugin](https://img.shields.io/badge/Claude%20Code-plugin-orange)](https://claude.ai/settings/plugins)
 
@@ -14,11 +14,11 @@
 
 ![scan-leaks demo](demo/scan-leaks.gif)
 
-**Hook protocol** — secret blocked at model boundary, PII surfaces ask dialog:
+**Hook protocol** — secret redacted in prompt, Claude reports what was caught:
 
 ![hook block demo](demo/hook-block.gif)
 
-**Selftest** — all 11 internal checks passing:
+**Selftest** — 22 internal checks passing:
 
 ![selftest demo](demo/selftest.gif)
 
@@ -26,36 +26,69 @@
 
 ## What it does
 
-Every time Claude reads a file, runs a command, or receives your prompt — leak-guard scans the content locally for secrets and PII. If it finds something, it blocks the data from entering the model. The raw value never leaves your machine.
+Every time you submit a prompt, Claude reads a file, or runs a command — leak-guard scans the content locally for secrets and PII. If something is found, the raw value is redacted inline with `[REDACTED]` and Claude is notified via an injected system note. The raw value never leaves your machine.
 
-**Secrets** (AWS/GCP/Azure keys, GitHub tokens, private keys, JWTs, …) → **hard block, always.**  
-**PII** (email, SSN, phone, credit card, IBAN, DOB, address) → **ask dialog — you decide.**
+The hook always exits 0 (no hard blocking of prompt delivery). Claude responds naturally, starting with what was detected and redacted.
+
+To bypass all findings for a single submission, prefix your prompt with `[allow-once]`.
 
 ---
 
-## Three enforcement layers
+## How it works
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Layer 1: Claude Code hooks                                 │
-│  UserPromptSubmit → PreToolUse → PostToolUse → SessionStart │
-│  Runs before data enters the model context window           │
-├─────────────────────────────────────────────────────────────┤
-│  Layer 2: /scan-leaks skill                                 │
-│  On-demand audit of any file or directory                   │
-├─────────────────────────────────────────────────────────────┤
-│  Layer 3: pre-push git hook (per-repo, optional)            │
-│  Blocks pushes made outside Claude Code (terminal, CI)      │
-└─────────────────────────────────────────────────────────────┘
+User prompt submitted
+        |
+        v
+UserPromptSubmit hook fires (before Claude sees it)
+        |
+        v
+scanner.py scans prompt text
+        |
+    findings?
+   /         \
+ yes           no
+  |             |
+Redact values   Pass through unchanged
+Inject SYSTEM NOTE via additionalContext
+        |
+        v
+Claude responds — reports what was caught and redacted
 ```
 
-All three layers run **100% locally**. No data is sent to any external service.
+All scanning runs 100% locally. No data is sent to any external service.
+
+---
+
+## Detection layers
+
+| Layer | What it catches |
+|---|---|
+| gitleaks (optional) | AWS/GCP/Azure/GitHub/Stripe/Slack keys, JWTs, private keys, and hundreds of provider-specific patterns |
+| Fast regex rules | High-signal credential patterns (fast_rules) |
+| PII regex (pii.toml) | Email, SSN, US phone, credit card (Luhn-validated), and more |
+| Entropy analysis | High-entropy base64 and hex strings |
+| Fuzzy credential detection | PREFIX:value patterns (e.g. `CSKC:...`) |
+| Filename blocklist | `.env`, `id_rsa`, `*.pem`, service account files, etc. |
+
+gitleaks is optional — leak-guard warns if it is absent but does not fail. If gitleaks is installed, it provides significantly deeper secret detection.
+
+---
+
+## Hook coverage
+
+| Hook | What it does |
+|---|---|
+| `UserPromptSubmit` | Scans user prompts; redacts findings before Claude sees them |
+| `PreToolUse` | Blocks Bash/Write/Edit calls that contain secrets in their input |
+| `PostToolUse` | Scans tool output (Bash stdout, file reads) for secrets/PII |
+| `SessionStart` | Scans for sensitive filenames in the working directory |
 
 ---
 
 ## Quick install
 
-**Prerequisite — install gitleaks:**
+**Optional but recommended — install gitleaks for deeper detection:**
 ```bash
 brew install gitleaks   # macOS
 # Linux: https://github.com/gitleaks/gitleaks#installing
@@ -67,53 +100,16 @@ brew install gitleaks   # macOS
 /plugin install leak-guard@leak-guard
 ```
 
-Restart Claude Code. On the next session you'll see:
+Restart Claude Code. On the next session you will see:
 ```
-leak-guard v0.1.0 active: hooks armed for secrets + PII.
-```
-
-**Optional — protect a git repo from terminal pushes too:**
-```
-/leak-guard-install-githook
+leak-guard v0.3.0 active: hooks armed for secrets + PII.
 ```
 
 ---
 
-## What gets detected
+## Configuration
 
-| Category | Examples | Action |
-|---|---|---|
-| AWS credentials | `AKIA…`, `aws_secret_access_key` | Hard block |
-| GCP / Azure / GitHub / Stripe / Slack keys | Provider-specific patterns | Hard block |
-| Private keys / JWTs | `-----BEGIN RSA PRIVATE KEY-----`, `eyJ…` | Hard block |
-| Sensitive filenames | `.env`, `id_rsa`, `*.pem`, `*credentials*.json` | Block Read |
-| Email address | `alice@company.com` | Ask dialog |
-| US SSN | `123-45-6789` | Ask dialog |
-| Credit card (Luhn-validated) | `4242 4242 4242 4242` | Ask dialog |
-| US phone | `(555) 867-5309` | Ask dialog |
-| IBAN / Passport / DOB / Address | Contextual patterns | Ask dialog |
-
-Secret detection is powered by [gitleaks](https://github.com/gitleaks/gitleaks) — the same engine used in GitHub's secret scanning. PII detection uses a local regex pack with Luhn validation for credit cards.
-
----
-
-## How the ask dialog works
-
-When PII is found in a `PreToolUse` event (e.g., you ask Claude to write a file containing an email address), Claude Code shows a permission dialog:
-
-```
-leak-guard: PII detected in Write input. Allow, deny, or cancel?
-  · [low] email — Email address line 3 in <Write-input> [REDACTED:email:17ch:hash=a3f2b1c4]
-  To always allow similar: add to ~/.claude/leak-guard/allowlist.toml
-```
-
-You choose: **allow** (logged), **deny** (Claude retries differently), or **cancel**.
-
----
-
-## Tuning false positives
-
-Create `~/.claude/leak-guard/allowlist.toml` to suppress known-safe values:
+**Suppress false positives** — create `~/.claude/leak-guard/allowlist.toml`:
 
 ```toml
 # Exact strings to always allow (placeholder emails, test values, etc.)
@@ -125,34 +121,67 @@ rule_ids = ["us-zip", "ipv4-private"]
 # Paths where all rules are suppressed (docs, fixtures, generated files)
 path_globs = ["*/docs/*", "*/tests/fixtures/*", "*/README.md"]
 
-# Set to true to suppress the stderr user notification when a block fires.
-# Blocks still happen and are still logged — only the visible warning is hidden.
-# silent_blocks = true
+# Bash command globs to suppress
+bash_globs = ["git log *", "echo *"]
 ```
 
 Changes apply immediately — no restart needed.
 
-### Common cases
+**Add custom detection rules** — create `~/.claude/leak-guard/custom_rules.toml`:
 
-| Trigger | Fix |
-|---|---|
-| Your git committer email in `git commit` output | Add your email to `literal` |
-| Placeholder emails in docs or READMEs | Add the file path to `path_globs` |
-| Test fixtures with synthetic PII | Add `*/tests/fixtures/*` to `path_globs` |
-| A noisy rule (e.g. ZIP codes in addresses) | Add the rule ID to `rule_ids` |
+```toml
+[[rules]]
+id = "my-internal-token"
+description = "Internal service token"
+pattern = "IST-[A-Z0-9]{32}"
+severity = "critical"
+```
 
 ---
 
-## Token cost
+## Commands
 
-| Event | Tokens | Frequency |
-|---|---|---|
-| SessionStart banner | ~80 | once per session |
-| Clean tool call | **0** | every call |
-| Block / ask on finding | ~100–250 | only when triggered |
-| PostToolUse block replacing a leaky file read | **net savings** | only when triggered |
+### Selftest and scanning
 
-On a clean day: ~80 tokens. Blocking a 3,000-token file read costs ~200 tokens instead — a net saving of ~2,800 tokens.
+```bash
+# Run 22 internal checks (Python version, state dir, rules, gitleaks, hook round-trip)
+python3 plugins/leak-guard/hooks/scanner.py selftest
+
+# Scan a file or directory
+python3 plugins/leak-guard/hooks/scanner.py scan-path <path>
+
+# Scan stdin
+echo "my text" | python3 plugins/leak-guard/hooks/scanner.py scan-text
+
+# Sync plugin to Claude Code cache
+python3 plugins/leak-guard/hooks/scanner.py install
+```
+
+### Tuning
+
+```bash
+# Suppress a false-positive value
+python3 plugins/leak-guard/hooks/scanner.py flag fp --literal <value>
+
+# Suppress a rule by ID
+python3 plugins/leak-guard/hooks/scanner.py flag fp --suppress-rule <rule_id>
+
+# Add a detection rule
+python3 plugins/leak-guard/hooks/scanner.py flag fn --rule-id <id> --pattern <regex>
+```
+
+### LLM verifier (opt-in)
+
+```bash
+# Enable/disable/check status of LLM cross-check on findings
+python3 plugins/leak-guard/hooks/scanner.py verifier enable
+python3 plugins/leak-guard/hooks/scanner.py verifier disable
+python3 plugins/leak-guard/hooks/scanner.py verifier status
+```
+
+### /scan-leaks skill
+
+From within Claude Code chat, run `/scan-leaks` to audit any file or directory on demand.
 
 ---
 
@@ -172,22 +201,21 @@ Raw matched values are never logged — only a SHA-256 prefix and character coun
 
 ```
 leak-guard/
-├── .claude-plugin/marketplace.json      ← marketplace catalog
+├── .claude-plugin/marketplace.json      <- marketplace catalog
 └── plugins/leak-guard/
-    ├── .claude-plugin/plugin.json       ← plugin manifest
+    ├── .claude-plugin/plugin.json       <- plugin manifest
     ├── hooks/
-    │   ├── hooks.json                   ← hook registrations
-    │   └── scanner.py                   ← detector engine (stdlib only)
-    ├── skills/scan-leaks/SKILL.md       ← /leak-guard:scan-leaks command
-    ├── commands/                        ← slash commands (git hook installer)
+    │   ├── hooks.json                   <- hook registrations
+    │   └── scanner.py                   <- detector engine (stdlib only)
+    ├── skills/scan-leaks/SKILL.md       <- /scan-leaks command
     ├── rules/
-    │   ├── pii.toml                     ← PII regex pack (10 rules)
-    │   ├── filenames.txt                ← sensitive filename blocklist
-    │   └── allowlist.toml               ← default suppressions
-    └── git-hooks/pre-push               ← layer 3 template
+    │   ├── pii.toml                     <- PII regex pack
+    │   ├── filenames.txt                <- sensitive filename blocklist
+    │   └── allowlist.toml              <- default suppressions
+    └── tests/                           <- pytest suite
 ```
 
-`scanner.py` is stdlib-only Python. The only external binary dependency is `gitleaks`. Fail-closed: if gitleaks is missing or the scanner crashes, all scanned events are blocked.
+`scanner.py` is stdlib-only Python. The only optional external binary is `gitleaks`. If gitleaks is absent, leak-guard warns but continues. If the scanner crashes, events are blocked (fail-closed).
 
 ---
 
@@ -196,10 +224,10 @@ leak-guard/
 ```bash
 cd ~/Projects/leak-guard
 
-# Internal smoke tests
+# Internal smoke tests (22 checks)
 python3 plugins/leak-guard/hooks/scanner.py selftest
 
-# Full test suite (50 tests)
+# Full test suite
 pytest tests/ -v
 ```
 
@@ -213,14 +241,23 @@ MIT — see [LICENSE](LICENSE).
 
 ## Changelog
 
+### v0.3.0 (2026-04-10)
+- Switched enforcement model: prompt values are redacted inline with `[REDACTED]`; Claude is notified via `additionalContext` SYSTEM NOTE rather than a hard block
+- Hook always exits 0 — no prompt suppression
+- `[allow-once]` prefix bypasses all findings for one submission
+- Expanded selftest to 22 checks (hook round-trip, training pipeline, gitleaks presence)
+- Added fuzzy credential detection (PREFIX:value patterns)
+- Added entropy analysis for base64/hex strings
+- LLM verifier opt-in (`verifier enable/disable/status`)
+- `flag fp/fn` commands for in-session tuning
+- gitleaks is now optional (WARN not FAIL if absent)
+
 ### v0.1.0 (2026-04-09)
 - Initial release
 - Four hook events: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`
 - gitleaks integration for secret/credential/cloud-key detection
-- 10-rule PII regex pack with Luhn credit card validation
-- Sensitive filename blocklist (`.env`, `*.pem`, `id_rsa`, service accounts, etc.)
-- `/leak-guard:scan-leaks` on-demand skill
-- Per-repo pre-push git hook (layer 3)
+- PII regex pack with Luhn credit card validation
+- Sensitive filename blocklist
+- `/scan-leaks` on-demand skill
 - User allowlist (`~/.claude/leak-guard/allowlist.toml`)
 - Audit log with redacted previews only
-- 50-test pytest suite

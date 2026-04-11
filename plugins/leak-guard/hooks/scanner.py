@@ -1481,7 +1481,6 @@ def hook_post_tool() -> int:
     allow = load_allowlist()
     silent = allow.silent_blocks
     # Honour path_globs for Read outputs — if the file path is allowlisted,
-    # skip scanning entirely (same logic as PreToolUse path check).
     if tool == "Read":
         file_path = tool_input.get("file_path", "")
         if file_path and path_allowlisted(file_path, allow):
@@ -1569,73 +1568,12 @@ Template placeholders (<YOUR_KEY>, {{TOKEN}}, ${VAR}) and obvious dummy values
 """.strip()
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Proxy management helpers (used by hook_session_start)
-# ──────────────────────────────────────────────────────────────────────────
-
-def _proxy_port() -> int:
-    return int(os.environ.get("LEAK_GUARD_PROXY_PORT", "8787"))
-
-
-def _proxy_running(port: int) -> bool:
-    """Return True if the proxy is listening on localhost:port."""
-    import socket
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=1):
-            return True
-    except OSError:
-        return False
-
-
-def _start_proxy(port: int) -> None:
-    """Spawn proxy.py as a detached background process."""
-    proxy_script = Path(__file__).parent.parent / "proxy.py"
-    if not proxy_script.exists():
-        return
-    subprocess.Popen(
-        [sys.executable, str(proxy_script), "--port", str(port)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-
-
 def hook_session_start() -> int:
     event = read_event()
     cwd = event.get("cwd", os.getcwd())
     gl = find_gitleaks()
 
-    # ── Proxy management ───────────────────────────────────────────────────
-    port = _proxy_port()
-    ctx_parts_prefix: list[str] = []
-    if not _proxy_running(port):
-        _start_proxy(port)
-        ctx_parts_prefix = [f"leak-guard proxy starting on :{port}"]
-
-    proxy_status = "proxy: intercepting" if _proxy_running(port) else "proxy: starting…"
-    ctx_parts = [f"leak-guard v0.3.0 active. {proxy_status}"]
-    ctx_parts_prefix.extend(ctx_parts[1:])  # merge any prefix items
-    ctx_parts = [ctx_parts[0]]  # reset; we'll re-add below
-
-    if not os.environ.get("ANTHROPIC_BASE_URL"):
-        # Write the helper script for the user
-        helper_dir = Path.home() / ".claude" / "leak-guard"
-        try:
-            helper_dir.mkdir(parents=True, exist_ok=True)
-            helper_script = helper_dir / "set-proxy-env.sh"
-            helper_script.write_text(
-                f"#!/bin/sh\n"
-                f"# Source this file to route Claude Code through leak-guard proxy.\n"
-                f"export ANTHROPIC_BASE_URL=http://localhost:{port}\n",
-                encoding="utf-8",
-            )
-            helper_script.chmod(0o755)
-        except Exception:
-            pass
-        ctx_parts.append(
-            f"WARNING: ANTHROPIC_BASE_URL not set — proxy running but not intercepting. "
-            f"Add to ~/.zshrc: export ANTHROPIC_BASE_URL=http://localhost:{port}"
-        )
+    ctx_parts = ["leak-guard v0.3.0 active"]
 
     if not gl:
         ctx_parts.append("⚠ gitleaks not installed — secret detection will fail-closed. Run: brew install gitleaks")
@@ -2059,21 +1997,7 @@ def cmd_selftest() -> int:
     al = Allowlist(path_globs=["*/fixtures/*"])
     check("path allowlist glob", path_allowlisted("/x/fixtures/a.txt", al))
 
-    # 11. Proxy selftest
-    proxy_script = Path(__file__).parent.parent / "proxy.py"
-    check("proxy.py exists", proxy_script.exists(), str(proxy_script))
-    port = _proxy_port()
-    if _proxy_running(port):
-        import urllib.request as _ur
-        try:
-            with _ur.urlopen(f"http://127.0.0.1:{port}/_leak_guard/health", timeout=2) as r:
-                health = json.loads(r.read())
-            check("proxy health endpoint", health.get("status") == "ok",
-                  f"pid={health.get('pid')}")
-        except Exception as exc:
-            check("proxy health endpoint", False, str(exc))
-    else:
-        check("proxy health endpoint", True, "proxy not running (skipped)")
+    # 11. (proxy removed)
 
     # Training mode (author-only)
     if _author_mode():
