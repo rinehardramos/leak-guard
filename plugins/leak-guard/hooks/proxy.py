@@ -1,15 +1,19 @@
 """
-leak-guard proxy core — redaction engine (Task 1).
+leak-guard proxy — redaction engine + HTTP proxy server.
 
-Functions used by the HTTP proxy to scan, redact, and manage pending state.
-HTTP server, threading, and daemon code are in separate tasks.
+Task 1 functions: scan, redact, pending state management.
+Task 2 additions: ThreadedHTTPServer, ProxyHandler, _forward logic.
 """
 
 from __future__ import annotations
 
+import http.client
+import http.server
 import json
 import os
+import ssl
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -275,3 +279,191 @@ def read_and_clear_pending() -> list[dict[str, Any]] | None:
     if time.time() - ts > _PENDING_TTL:
         return None
     return data.get("findings")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Runtime counters
+# ──────────────────────────────────────────────────────────────────────────
+
+_requests_redacted = 0
+_last_activity = time.time()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# HTTP server
+# ──────────────────────────────────────────────────────────────────────────
+
+class ThreadedHTTPServer(http.server.HTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def process_request(self, request, client_address):
+        t = threading.Thread(target=self._handle, args=(request, client_address))
+        t.daemon = True
+        t.start()
+
+    def _handle(self, request, client_address):
+        try:
+            self.finish_request(request, client_address)
+        except Exception:
+            pass
+        finally:
+            self.shutdown_request(request)
+
+
+class ProxyHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    # ── routing ──────────────────────────────────────────────────────────
+
+    def do_GET(self):
+        if self.path == "/lg-status":
+            self._health()
+        else:
+            self._forward("GET")
+
+    def do_POST(self):
+        self._forward("POST")
+
+    # ── health endpoint ───────────────────────────────────────────────────
+
+    def _health(self):
+        global _requests_redacted
+        body = json.dumps({
+            "status": "ok",
+            "allowlist_size": len(_sc.load_allowlist().literal),
+            "requests_redacted": _requests_redacted,
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    # ── proxy core ────────────────────────────────────────────────────────
+
+    def _forward(self, method: str):
+        global _requests_redacted, _last_activity
+        _last_activity = time.time()
+
+        # Read request body
+        length = int(self.headers.get("Content-Length", 0))
+        raw_body = self.rfile.read(length) if length else b""
+
+        is_messages = "/v1/messages" in self.path and "count_tokens" not in self.path
+        is_count_tokens = "count_tokens" in self.path
+
+        body = raw_body
+        payload = None
+
+        # Parse JSON payload for messages/count_tokens endpoints
+        if (is_messages or is_count_tokens) and raw_body:
+            try:
+                payload = json.loads(raw_body)
+            except (json.JSONDecodeError, ValueError):
+                payload = None
+
+        if payload is not None:
+            allowlist = load_allowlist()
+
+            if is_messages:
+                handled_pending = False
+                user_text = get_last_user_text(payload)
+                pending = read_and_clear_pending()
+
+                if pending is not None and user_text is not None:
+                    choice = is_allow_response(user_text)
+                    if choice == "allow":
+                        masked_values = []
+                        for f in pending:
+                            _append_literal(f["raw"], "user allowed via proxy")
+                            masked_values.append(f["tag"])
+                        payload = inject_allow_confirmation(payload, masked_values)
+                        _requests_redacted += 1
+                        handled_pending = True
+                    elif choice == "redact":
+                        payload = inject_redact_confirmation(payload)
+                        handled_pending = True
+                    # If choice is None, fall through to normal scan below
+
+                if not handled_pending:
+                    # If pending existed but choice was None, re-write pending
+                    # so the question remains active, then do normal scan
+                    payload, findings = scan_and_redact_payload(payload, allowlist)
+                    if findings:
+                        payload = inject_system_note_with_question(payload, findings)
+                        write_pending(findings)
+                        _requests_redacted += 1
+
+            elif is_count_tokens:
+                # Silent redact — no pending state, no system note
+                payload, _ = scan_and_redact_payload(payload, allowlist)
+
+            body = json.dumps(payload).encode()
+
+        # Build upstream request headers (strip hop-by-hop headers)
+        skip_headers = {"host", "transfer-encoding", "content-length"}
+        upstream_headers = {}
+        for key, val in self.headers.items():
+            if key.lower() not in skip_headers:
+                upstream_headers[key] = val
+        upstream_headers["Host"] = UPSTREAM_HOST
+        upstream_headers["Content-Length"] = str(len(body))
+
+        # Determine streaming
+        is_stream = False
+        if payload is not None and isinstance(payload, dict):
+            is_stream = bool(payload.get("stream", False))
+
+        # Forward to upstream via HTTPS
+        try:
+            ctx = ssl.create_default_context()
+            conn = http.client.HTTPSConnection(UPSTREAM_HOST, UPSTREAM_PORT, context=ctx)
+            conn.request(method, self.path, body=body, headers=upstream_headers)
+            resp = conn.getresponse()
+        except Exception:
+            self._send_502()
+            return
+
+        # Send response status and headers
+        self.send_response(resp.status)
+        skip_resp = {"transfer-encoding", "content-length"}
+        for key, val in resp.getheaders():
+            if key.lower() not in skip_resp:
+                self.send_header(key, val)
+
+        if is_stream:
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            try:
+                while True:
+                    chunk = resp.read(8192)
+                    if not chunk:
+                        break
+                    self.wfile.write(f"{len(chunk):x}\r\n".encode())
+                    self.wfile.write(chunk)
+                    self.wfile.write(b"\r\n")
+                    self.wfile.flush()
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except Exception:
+                pass
+        else:
+            resp_body = resp.read()
+            self.send_header("Content-Length", str(len(resp_body)))
+            self.end_headers()
+            self.wfile.write(resp_body)
+
+        conn.close()
+
+    def _send_502(self):
+        body = b'{"error": "bad_gateway"}'
+        self.send_response(502)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        # Suppress default BaseHTTPRequestHandler logging
+        pass

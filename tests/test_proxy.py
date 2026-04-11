@@ -1,12 +1,17 @@
-"""Tests for proxy.py core redaction engine (Task 1)."""
+"""Tests for proxy.py core redaction engine (Task 1) and HTTP server (Task 2)."""
 
 from __future__ import annotations
 
 import json
+import socket
 import sys
+import threading
 import time
+import urllib.request
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 PROXY_MODULE = Path(__file__).resolve().parent.parent / "plugins" / "leak-guard" / "hooks"
 sys.path.insert(0, str(PROXY_MODULE))
@@ -312,3 +317,177 @@ class TestPendingState:
             px.PENDING_FILE.unlink()
         result = px.read_and_clear_pending()
         assert result is None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Helpers for Task 2 tests
+# ──────────────────────────────────────────────────────────────────────────
+
+def _find_free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+@pytest.fixture
+def proxy_server(tmp_path, monkeypatch):
+    """Start a proxy server on a random port for testing."""
+    port = _find_free_port()
+    monkeypatch.setattr(px, "PENDING_FILE", tmp_path / "pending.json")
+    monkeypatch.setattr(px, "STATE_DIR", tmp_path)
+    server = px.ThreadedHTTPServer(("127.0.0.1", port), px.ProxyHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield port, server
+    server.shutdown()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# TestHealthEndpoint
+# ──────────────────────────────────────────────────────────────────────────
+
+class TestHealthEndpoint:
+    def test_status_ok(self, proxy_server):
+        port, _ = proxy_server
+        resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/lg-status")
+        data = json.loads(resp.read())
+        assert data["status"] == "ok"
+        assert "allowlist_size" in data
+        assert "requests_redacted" in data
+
+    def test_allowlist_size_is_int(self, proxy_server):
+        port, _ = proxy_server
+        resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/lg-status")
+        data = json.loads(resp.read())
+        assert isinstance(data["allowlist_size"], int)
+        assert data["allowlist_size"] >= 0
+
+    def test_requests_redacted_is_int(self, proxy_server):
+        port, _ = proxy_server
+        resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/lg-status")
+        data = json.loads(resp.read())
+        assert isinstance(data["requests_redacted"], int)
+        assert data["requests_redacted"] >= 0
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# TestProxyAllowlist
+# ──────────────────────────────────────────────────────────────────────────
+
+class TestProxyAllowlist:
+    """Allow choice persists to allowlist, subsequent requests skip allowed values."""
+
+    def test_allow_updates_allowlist(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(px, "PENDING_FILE", tmp_path / "pending.json")
+        monkeypatch.setattr(px, "STATE_DIR", tmp_path)
+        monkeypatch.setattr(sc, "USER_ALLOWLIST", tmp_path / "allowlist.toml")
+
+        # Turn 1: write pending with a test SSN-like value
+        ssn_value = "456-78-9012"
+        findings = [
+            {
+                "type": "us-ssn",
+                "raw": ssn_value,
+                "tag": "[REDACTED:us-ssn]",
+                "rule_id": "us-ssn",
+                "confidence": 0.90,
+            }
+        ]
+        px.write_pending(findings)
+
+        # Turn 2: user says "a" (allow)
+        pending = px.read_and_clear_pending()
+        assert pending is not None
+        choice = px.is_allow_response("a")
+        assert choice == "allow"
+        for f in pending:
+            sc._append_literal(f["raw"], "test allow")
+
+        # Verify allowlist contains the raw value
+        al = sc.load_allowlist()
+        assert ssn_value in al.literal
+
+        # Turn 3: same value should not be redacted
+        payload = {
+            "messages": [
+                {"role": "user", "content": f"My SSN is {ssn_value}"},
+            ]
+        }
+        result, new_findings = px.scan_and_redact_payload(payload, al)
+        assert len(new_findings) == 0
+        assert ssn_value in result["messages"][0]["content"]
+
+    def test_redact_choice_clears_pending(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(px, "PENDING_FILE", tmp_path / "pending.json")
+        monkeypatch.setattr(px, "STATE_DIR", tmp_path)
+
+        findings = [
+            {
+                "type": "us-ssn",
+                "raw": "456-78-9012",
+                "tag": "[REDACTED:us-ssn]",
+                "rule_id": "us-ssn",
+                "confidence": 0.90,
+            }
+        ]
+        px.write_pending(findings)
+
+        # Simulate Turn 2: user says "r"
+        pending = px.read_and_clear_pending()
+        assert pending is not None
+        choice = px.is_allow_response("r")
+        assert choice == "redact"
+
+        # Pending file should now be gone
+        assert not (tmp_path / "pending.json").exists()
+
+    def test_none_choice_does_not_consume_pending(self, tmp_path, monkeypatch):
+        """When user sends unrecognised text, pending should still be re-writable."""
+        monkeypatch.setattr(px, "PENDING_FILE", tmp_path / "pending.json")
+        monkeypatch.setattr(px, "STATE_DIR", tmp_path)
+
+        findings = [
+            {
+                "type": "us-ssn",
+                "raw": "456-78-9012",
+                "tag": "[REDACTED:us-ssn]",
+                "rule_id": "us-ssn",
+                "confidence": 0.90,
+            }
+        ]
+        px.write_pending(findings)
+
+        # is_allow_response returns None for unrecognised text
+        choice = px.is_allow_response("what does that mean?")
+        assert choice is None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# TestThreadedHTTPServer
+# ──────────────────────────────────────────────────────────────────────────
+
+class TestThreadedHTTPServer:
+    def test_server_starts_and_responds(self, proxy_server):
+        port, _ = proxy_server
+        resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/lg-status")
+        assert resp.status == 200
+
+    def test_server_handles_concurrent_requests(self, proxy_server):
+        port, _ = proxy_server
+        results = []
+
+        def fetch():
+            try:
+                resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/lg-status")
+                results.append(resp.status)
+            except Exception as e:
+                results.append(str(e))
+
+        threads = [threading.Thread(target=fetch) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        assert len(results) == 5
+        assert all(r == 200 for r in results), f"Unexpected results: {results}"
