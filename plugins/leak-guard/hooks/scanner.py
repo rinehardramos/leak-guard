@@ -1474,6 +1474,32 @@ def _handle_choice(choice: str, pending: dict) -> int:
             redacted = redacted.replace(raw, tag)
 
     instruction = _build_redact_instruction(redacted, findings)
+
+    # Add symbolic fingerprints for borderline findings
+    borderline = [f for f in findings if f.get("rule_id") in _BORDERLINE_RULES]
+    if borderline:
+        fp_lines = ["\n\nleak-guard: Borderline values were redacted. Symbolic profiles:"]
+        for f in borderline:
+            raw = f.get("raw_match", "")
+            if raw:
+                dummy_finding = Finding(f["rule_id"], f.get("category", ""), "",
+                                        0, "", raw_match=raw)
+                fp = _build_symbolic_fingerprint(dummy_finding, original_prompt)
+                fp_lines.append(
+                    f"  Rule: {fp['rule_id']}\n"
+                    f"  Length: {fp['length']} chars, entropy: {fp['entropy']} bits/char, "
+                    f"charset: {fp['charset']}\n"
+                    f"  Position: {fp['position']}\n"
+                    f"  Context keywords: {', '.join(fp['context_keywords']) or 'none'}\n"
+                    f"  Adjacent code: {fp['adjacent_code']}"
+                )
+        fp_lines.append(
+            "\nIf these profiles suggest computed/derived values rather than "
+            "credentials, inform the user they were likely false positives and "
+            "they can re-send with 'a' to allowlist them."
+        )
+        instruction += "\n".join(fp_lines)
+
     emit_allow_modified(instruction)
     return 0
 
@@ -1545,6 +1571,60 @@ def _build_redact_instruction(redacted_prompt: str, findings: list[dict]) -> str
         "anonymized or synthetic values instead. Do not attempt to guess or "
         "reconstruct the redacted values."
     )
+
+
+def _build_symbolic_fingerprint(finding: Finding, text: str) -> dict:
+    """Build a symbolic fingerprint for a finding — never includes raw value."""
+    val = finding.raw_match
+    if not val:
+        return {"rule_id": finding.rule_id, "length": 0, "entropy": 0.0,
+                "charset": "unknown", "context_keywords": [], "position": "unknown",
+                "adjacent_code": "", "has_vendor_prefix": False, "unique_ratio": 0.0}
+
+    # Determine charset
+    stripped = val.replace("-", "").replace("_", "")
+    if stripped and all(c in "0123456789abcdefABCDEF" for c in stripped):
+        charset = "hex"
+    elif all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_~-" for c in val):
+        charset = "base64url"
+    else:
+        charset = "mixed"
+
+    # Extract surrounding code with value masked
+    idx = text.find(val)
+    if idx >= 0:
+        start = max(0, idx - 40)
+        end = min(len(text), idx + len(val) + 40)
+        window = text[start:end].replace(val, "___")
+    else:
+        window = ""
+
+    # Context keywords in window
+    keywords = [kw for kw in _SECRET_CONTEXT_KEYWORDS if kw in window.lower()]
+
+    # Determine position
+    if idx >= 0:
+        pre = text[max(0, idx - 5):idx]
+        if re.search(r'[=:]\s*["\']?$', pre):
+            position = "rhs_of_assignment"
+        elif "://" in window:
+            position = "in_url"
+        else:
+            position = "standalone"
+    else:
+        position = "unknown"
+
+    return {
+        "rule_id": finding.rule_id,
+        "length": len(val),
+        "entropy": round(_shannon_entropy(val), 2),
+        "charset": charset,
+        "unique_ratio": round(len(set(val.lower())) / len(val), 2) if val else 0.0,
+        "context_keywords": keywords,
+        "position": position,
+        "has_vendor_prefix": any(val.startswith(p) for p in _VENDOR_PREFIXES),
+        "adjacent_code": window,
+    }
 
 
 # Prefix the user can prepend to bypass heuristic (non-gitleaks) findings for one submission.

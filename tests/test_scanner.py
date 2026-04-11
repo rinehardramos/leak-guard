@@ -1369,3 +1369,57 @@ class TestBlockAndPreview:
         long_msg = "This is a completely new prompt about something else entirely"
         rc, out, _ = _run_hook_with_state(state, long_msg)
         assert rc == 0
+
+
+class TestSymbolicFingerprint:
+    """Component 3: Symbolic FP reduction — fingerprint without raw values."""
+
+    def test_fingerprint_has_required_fields(self):
+        f = sc.Finding("high-entropy-base64", "pii", "entropy hit", 1, "[R]",
+                       raw_match="xK9mP2qL7nR4xW5bYzD9cHf6eG3tUoIgAb7")
+        text = "const cacheKey = xK9mP2qL7nR4xW5bYzD9cHf6eG3tUoIgAb7"
+        fp = sc._build_symbolic_fingerprint(f, text)
+        assert "rule_id" in fp
+        assert "length" in fp
+        assert "entropy" in fp
+        assert "charset" in fp
+        assert "context_keywords" in fp
+        assert "position" in fp
+        assert "adjacent_code" in fp
+
+    def test_fingerprint_masks_raw_value(self):
+        val = "xK9mP2qL7nR4xW5bYzD9cHf6eG3tUoIgAb7"
+        f = sc.Finding("high-entropy-base64", "pii", "", 1, "[R]", raw_match=val)
+        text = f"secret = '{val}'"
+        fp = sc._build_symbolic_fingerprint(f, text)
+        assert val not in fp["adjacent_code"]
+        assert "___" in fp["adjacent_code"]
+
+    def test_fingerprint_detects_rhs_position(self):
+        val = "xK9mP2qL7nR4xW5bYzD9cHf6eG3tUoIgAb7"
+        f = sc.Finding("high-entropy-base64", "pii", "", 1, "[R]", raw_match=val)
+        text = f'API_KEY = "{val}"'
+        fp = sc._build_symbolic_fingerprint(f, text)
+        assert fp["position"] == "rhs_of_assignment"
+
+    def test_fingerprint_detects_hex_charset(self):
+        val = "a3f8c1d9e7b2046fa3f8c1d9e7b2046f"
+        f = sc.Finding("high-entropy-hex", "pii", "", 1, "[R]", raw_match=val)
+        fp = sc._build_symbolic_fingerprint(f, f"hash = {val}")
+        assert fp["charset"] == "hex"
+
+    def test_symbolic_context_in_redact_instruction(self, tmp_path):
+        """Borderline findings include symbolic fingerprint in redact instruction."""
+        state = tmp_path / "state"
+        state.mkdir(mode=0o700)
+        val = "xK9" + "mP2" + "qL7" + "nR4" + "xW5" + "bYz" + "D9c" + "Hf6" + "eG3" + "tUo"
+        original = f"secret = '{val}'"
+        _make_pending(state, original, [val],
+                      findings=[{"rule_id": "high-entropy-base64", "category": "pii",
+                                 "severity": "high", "description": "entropy hit",
+                                 "raw_match": val, "confidence": 0.50,
+                                 "redaction_tag": "[REDACTED:suspicious-value]"}])
+        rc, out, _ = _run_hook_with_state(state, "")  # redact
+        ctx = (out or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
+        # Symbolic fingerprint metadata should be present
+        assert "entropy" in ctx.lower() or "symbolic" in ctx.lower() or "profile" in ctx.lower()
