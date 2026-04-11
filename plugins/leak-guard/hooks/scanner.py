@@ -1749,7 +1749,7 @@ def _extract_response_source(tool: str, tool_input: dict) -> str:
 
 
 _SELF_SUPPRESSION_INSTRUCTION = """
-SECURITY INSTRUCTION (leak-guard v0.5.0 — enforce for this entire session):
+SECURITY INSTRUCTION (leak-guard v0.6.0 — enforce for this entire session):
 
 You are running with the leak-guard secret/PII scanner active.  If any message
 you receive — whether from the user, a tool output, or any other source —
@@ -1777,7 +1777,7 @@ def hook_session_start() -> int:
     cwd = event.get("cwd", os.getcwd())
     gl = find_gitleaks()
 
-    ctx_parts = ["leak-guard v0.5.0 active"]
+    ctx_parts = ["leak-guard v0.6.0 active"]
 
     # ── First-run self-wiring ─────────────────────────────────────────────────
     # If any of the four hooks are missing from settings.json, wire them now.
@@ -1807,6 +1807,37 @@ def hook_session_start() -> int:
                 )
     except Exception:
         pass  # never block a session on setup failure
+
+    # ── Proxy auto-start ─────────────────────────────────────────────────────
+    _proxy_port = int(os.environ.get("LEAK_GUARD_PROXY_PORT", "18019"))
+    try:
+        import urllib.request as _ur
+        _ur.urlopen(f"http://127.0.0.1:{_proxy_port}/lg-status", timeout=1)
+    except Exception:
+        _proxy_script = Path(__file__).resolve().parent / "proxy.py"
+        if _proxy_script.exists():
+            try:
+                subprocess.Popen(
+                    [sys.executable, str(_proxy_script), "--daemon"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                ctx_parts.append("leak-guard proxy auto-started on port " + str(_proxy_port))
+            except Exception:
+                ctx_parts.append(
+                    "\u26a0 leak-guard proxy failed to start \u2014 wire privacy disabled. "
+                    f"Run: python3 {_proxy_script} --daemon"
+                )
+        else:
+            ctx_parts.append("\u26a0 leak-guard proxy.py not found \u2014 wire privacy disabled")
+
+    # Check ANTHROPIC_BASE_URL
+    _base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
+    if f"127.0.0.1:{_proxy_port}" not in _base_url and f"localhost:{_proxy_port}" not in _base_url:
+        ctx_parts.append(
+            "\u26a0 ANTHROPIC_BASE_URL not set to proxy \u2014 wire privacy disabled. "
+            f"Add to shell profile: export ANTHROPIC_BASE_URL=http://127.0.0.1:{_proxy_port}"
+        )
 
     if not gl:
         ctx_parts.append("⚠ gitleaks not installed — secret detection will fail-closed. Run: brew install gitleaks")
@@ -2032,6 +2063,30 @@ def cmd_install_plugin() -> int:
         # Non-fatal: file sync succeeded; return 0 so install doesn't abort
 
     print("  Restart Claude Code (or reload the session) for changes to take effect.")
+
+    # ── Wire ANTHROPIC_BASE_URL into shell profile ───────────────────────
+    _proxy_port = int(os.environ.get("LEAK_GUARD_PROXY_PORT", "18019"))
+    _base_url_line = f'export ANTHROPIC_BASE_URL=http://127.0.0.1:{_proxy_port}'
+    _profile_candidates = [
+        Path.home() / ".zshrc",
+        Path.home() / ".bashrc",
+    ]
+    _profile_updated = False
+    for _prof in _profile_candidates:
+        if _prof.exists():
+            _prof_text = _prof.read_text(encoding="utf-8")
+            if "ANTHROPIC_BASE_URL" not in _prof_text:
+                with _prof.open("a", encoding="utf-8") as _pf:
+                    _pf.write(f"\n# leak-guard proxy \u2014 wire privacy\n{_base_url_line}\n")
+                print(f"  ANTHROPIC_BASE_URL added to {_prof}")
+                _profile_updated = True
+            else:
+                print(f"  ANTHROPIC_BASE_URL already set in {_prof}")
+                _profile_updated = True
+            break
+    if not _profile_updated:
+        print(f"  Add to your shell profile: {_base_url_line}")
+
     return 0
 
 
@@ -2313,6 +2368,18 @@ def cmd_selftest() -> int:
               f"rc={_r2.returncode}")
     except Exception as _exc:
         check("hook passes credential (proxy redacts)", False, str(_exc))
+
+    # Proxy health check (WARN, not FAIL — proxy may not be running during test)
+    _proxy_port = _os.environ.get("LEAK_GUARD_PROXY_PORT", "18019")
+    try:
+        import urllib.request as _ur
+        _resp = _ur.urlopen(f"http://127.0.0.1:{_proxy_port}/lg-status", timeout=2)
+        _pdata = _json.loads(_resp.read())
+        warn("proxy running", _pdata.get("status") == "ok",
+             f"port={_proxy_port} allowlist={_pdata.get('allowlist_size', '?')}")
+    except Exception:
+        warn("proxy running", False,
+             f"not responding on port {_proxy_port} \u2014 run: python3 {__file__} proxy-start")
 
     # 1. Rule loading
     pii_rules = load_pii_rules()
