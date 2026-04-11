@@ -2146,6 +2146,37 @@ def cmd_selftest() -> int:
     else:
         check("training mode", True, "disabled (not author machine — expected for other users)")
 
+    # ── Hook wiring check ─────────────────────────────────────────────────────
+    try:
+        import json as _json
+        settings_path = Path.home() / ".claude" / "settings.json"
+        if settings_path.exists():
+            data = _json.loads(settings_path.read_text(encoding="utf-8"))
+            hooks = data.get("hooks", {})
+            me = str(Path(__file__).resolve())
+            for event, subcmd in [
+                ("UserPromptSubmit", "hook-user-prompt"),
+                ("PreToolUse", "hook-pre-tool"),
+                ("PostToolUse", "hook-post-tool"),
+                ("SessionStart", "hook-session-start"),
+            ]:
+                entries = hooks.get(event, [])
+                found = any(
+                    subcmd in h.get("command", "")
+                    for e in entries
+                    for h in e.get("hooks", [])
+                )
+                warn(
+                    f"hook wired: {event}",
+                    found,
+                    f"Run: python3 {me} hook-settings",
+                )
+        else:
+            warn("settings.json exists", False,
+                 "~/.claude/settings.json not found — run: python3 scanner.py install")
+    except Exception as exc:
+        warn("hook wiring check", False, str(exc))
+
     print(f"\n{'OK' if failures == 0 else 'FAILED'}: {failures} failure(s)")
     return 0 if failures == 0 else 1
 
