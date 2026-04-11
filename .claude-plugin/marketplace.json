@@ -5,7 +5,7 @@
   },
   "metadata": {
     "description": "Local-first PII & secret scanner for Claude Code — blocks leaks before they reach the model",
-    "version": "0.5.0"
+    "version": "0.6.0"
   },
   "plugins": [
     {
