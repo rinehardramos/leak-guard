@@ -591,7 +591,7 @@ class TestDummyValues:
         """Hostnames are NOT suppressed — they route through the action picker."""
         # The heuristic path (action picker) handles these; _is_dummy_value must
         # not silently drop them, since a hostname in a credential context is suspicious.
-        assert not sc._is_dummy_value("Rinehards-MacBook-Pro")
+        assert not sc._is_dummy_value("Devs-MacBook-Pro")
         assert not sc._is_dummy_value("my-server.local")
 
     def test_git_committer_line_is_heuristic(self):

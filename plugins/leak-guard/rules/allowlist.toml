@@ -9,11 +9,17 @@
 #                  warning is hidden). Default: false.
 
 literal = [
-    # Common placeholder / dummy emails
+    # Common placeholder / dummy emails (RFC 2606 reserved domains)
     "user@example.com",
     "test@example.com",
     "admin@example.com",
     "noreply@example.com",
+    "user@example.org",
+    "admin@example.org",
+    "test@example.org",
+    "user@example.net",
+    "admin@example.net",
+    "test@example.net",
     "foo@bar.com",
     # Dummy cards (documentation/test values — still Luhn-valid)
     "4242 4242 4242 4242",

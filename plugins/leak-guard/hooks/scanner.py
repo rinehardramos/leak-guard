@@ -195,6 +195,10 @@ def luhn_valid(number: str) -> bool:
     digits = [int(d) for d in number if d.isdigit()]
     if len(digits) < 13 or len(digits) > 19:
         return False
+    # All-same-digit strings (0000000000000000) pass Luhn mathematically
+    # but are never real card numbers.
+    if len(set(digits)) == 1:
+        return False
     checksum = 0
     parity = len(digits) % 2
     for i, d in enumerate(digits):
@@ -434,6 +438,44 @@ _PLACEHOLDER_SHAPE_RE = re.compile(
 )
 
 
+_PLACEHOLDER_WORD_RE = re.compile(
+    r'^(YOUR|MY|EXAMPLE|SAMPLE|TEST|FAKE|DUMMY|INSERT|REPLACE|CHANGE|ENTER|PLACEHOLDER)[_\-][A-Z]',
+)
+
+# Vendor credential prefixes — stripped before checking if the payload is a dummy.
+_VENDOR_PREFIXES = (
+    "ghp_", "ghs_", "gho_", "ghu_", "github_pat_",
+    "sk_live_", "sk_test_", "pk_live_", "pk_test_",
+    "rk_live_", "rk_test_", "AKIA",
+    "npm_", "pypi-", "sk-ant-api", "sk-proj-",
+    "SG.", "SK", "xox", "AIza",
+)
+
+
+def _is_sequential_string(s: str) -> bool:
+    """Return True if the string is *predominantly* a sequential walk.
+
+    Only suppresses strings where sequential characters make up at least
+    half the total length AND the longest sequential run is at least 10.
+    This avoids false-suppressing real tokens that happen to contain
+    a short '123456' substring.
+    """
+    if len(s) < 10:
+        return False
+    longest_run = 1
+    current_run = 1
+    total_sequential = 0
+    for i in range(1, len(s)):
+        if ord(s[i]) == ord(s[i - 1]) + 1:
+            current_run += 1
+            longest_run = max(longest_run, current_run)
+        else:
+            total_sequential += max(0, current_run - 1)
+            current_run = 1
+    total_sequential += max(0, current_run - 1)
+    return longest_run >= 10 and total_sequential >= len(s) // 2
+
+
 def _is_dummy_value(val: str) -> bool:
     """Return True only for values that are *structurally* non-secrets.
 
@@ -445,6 +487,9 @@ def _is_dummy_value(val: str) -> bool:
     - Runs of a single repeated character (xxxxxxxx, 00000000, ********).
     - Template syntax wrappers: <...>, {{...}}, ${...}, $VAR, %VAR%.
     - 40-char all-lowercase-hex strings (git commit SHAs).
+    - Placeholder word prefixes (YOUR_API_KEY, EXAMPLE_TOKEN, etc.).
+    - Sequential character runs (abcdefgh, 12345678).
+    - Docs-template connection strings containing literal 'password'/'localhost'.
     """
     stripped = val.strip().strip("'\"`").strip()
     if not stripped:
@@ -458,6 +503,25 @@ def _is_dummy_value(val: str) -> bool:
     # 40-char all-lowercase-hex → git SHA, not a secret.
     if len(stripped) == 40 and all(c in "0123456789abcdef" for c in stripped.lower()):
         return True
+    # Placeholder word prefixes (YOUR_API_KEY, EXAMPLE_TOKEN, etc.)
+    if _PLACEHOLDER_WORD_RE.match(stripped):
+        return True
+    # Sequential ASCII runs (abcdefghijklm..., 123456789...)
+    if _is_sequential_string(stripped):
+        return True
+    # Docs-template connection strings: literal 'password' or 'localhost' in value
+    lower = stripped.lower()
+    if "localhost" in lower or "://user:password@" in lower:
+        return True
+    # Strip vendor credential prefix (ghp_, sk_live_, etc.) and re-check payload
+    for vp in _VENDOR_PREFIXES:
+        if stripped.startswith(vp):
+            payload = stripped[len(vp):]
+            if payload and len(set(payload.lower())) == 1:
+                return True
+            if _PLACEHOLDER_WORD_RE.match(payload):
+                return True
+            break
     return False
 
 
@@ -514,6 +578,14 @@ def scan_entropy(text: str, allow: Allowlist, source: str = "") -> list[Finding]
             return
         if _is_dummy_value(candidate):
             return
+        # If the regex matched across an '=' (env-var assignment captured as one
+        # token), check if the RHS alone is a dummy value or a protocol prefix.
+        if "=" in candidate:
+            parts = candidate.split("=", 1)
+            rhs = parts[1] if len(parts) > 1 else ""
+            if _is_dummy_value(rhs) or rhs.startswith(("http", "postgresql", "postgres",
+                    "mysql", "mongodb", "redis", "sqlite", "amqp", "smtp")):
+                return
         # Skip plain URLs
         start = max(0, m.start() - 8)
         prefix = text[start:m.start()]
@@ -694,6 +766,14 @@ def scan_secrets_fast(text: str, source: str = "") -> list[Finding]:
     for rule_id, pattern, severity in _FAST_RULES:
         for m in pattern.finditer(text):
             matched = m.group(0)
+            # Strip known vendor prefix to check payload for dummy values
+            payload = matched
+            for pfx in _VENDOR_PREFIXES:
+                if payload.startswith(pfx):
+                    payload = payload[len(pfx):]
+                    break
+            if _is_dummy_value(payload):
+                continue
             upto = text[:m.start()]
             findings.append(Finding(
                 rule_id=rule_id,
@@ -799,6 +879,10 @@ def scan_secrets_gitleaks(text: str | None = None, path: str | None = None,
             rule_id = item.get("RuleID", "unknown-secret")
             # Never store the raw secret — use a length+hash preview
             raw = item.get("Secret", "") or item.get("Match", "") or "x"
+            # Suppress findings where the secret value is a placeholder/dummy.
+            # Gitleaks matches on prefix alone (e.g. ghp_XXXX...) — filter here.
+            if _is_dummy_value(raw):
+                continue
             findings.append(Finding(
                 rule_id=rule_id,
                 category="secret",
