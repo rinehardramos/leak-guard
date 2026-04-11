@@ -1371,25 +1371,34 @@ PENDING_ACTION = STATE_DIR / "pending_action.json"
 _PENDING_TTL = 300  # 5 minutes
 
 
-def _write_pending_action(prompt: str, findings: list) -> None:
-    """Write pending_action.json with mode 0o600. findings is a list of Finding objects."""
+def _write_pending_action(prompt: str, findings: list[Finding]) -> None:
+    """Write pending_action.json with mode 0o600.
+
+    Stores enriched finding data for Turn 2 redact/allow handling.
+    """
     try:
         ensure_state_dir()
         data = {
             "prompt": prompt,
-            "redact_targets": [f.raw_match for f in findings if f.raw_match],
-            "findings_summary": [
-                {"rule_id": f.rule_id, "severity": f.severity, "preview": f.preview}
+            "findings": [
+                {
+                    "rule_id": f.rule_id,
+                    "category": f.category,
+                    "severity": f.severity,
+                    "description": f.description,
+                    "raw_match": f.raw_match,
+                    "confidence": _confidence(f),
+                    "redaction_tag": _redaction_tag(f),
+                }
                 for f in findings
             ],
             "expires_at": time.time() + _PENDING_TTL,
         }
-        # Write with restricted permissions
         fd = os.open(str(PENDING_ACTION), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(data, fh)
     except Exception:
-        pass  # fail open: if we can't write, fall through to normal scan next turn
+        pass
 
 
 def _read_pending_action() -> dict | None:
@@ -1410,36 +1419,35 @@ def _read_pending_action() -> dict | None:
 
 
 def _is_choice_reply(prompt: str) -> str | None:
-    """Return normalised choice ('A','R','D','F') if prompt is a reply to the action picker.
+    """Return 'redact' or 'allow' if prompt is a reply to the block-and-preview.
 
-    Returns None if no pending_action.json exists — avoids intercepting
-    genuine one-letter prompts when there's nothing pending.
+    Returns None if no pending_action.json exists or response is a new prompt.
     """
-    # Check pending file first to avoid intercepting genuine one-letter prompts
     try:
         if not PENDING_ACTION.exists():
             return None
     except Exception:
         return None
-
     stripped = prompt.strip().lower()
-    if stripped in {"a", "r", "d", "f"}:
-        return stripped.upper()
-    if stripped.startswith("allow"):
-        return "A"
-    if stripped.startswith("redact"):
-        return "R"
-    if stripped.startswith("discard") or stripped.startswith("delete"):
-        return "D"
-    if stripped.startswith("flag"):
-        return "F"
-    return None
+    # Explicit allow
+    if stripped in ("a", "allow"):
+        return "allow"
+    # Enter (empty), or any short redact-like response
+    if not stripped or stripped in ("r", "redact", ".", "y", "yes"):
+        return "redact"
+    # Long responses (>20 chars) are likely new prompts, not choices.
+    if len(stripped) > 20:
+        PENDING_ACTION.unlink(missing_ok=True)
+        return None
+    # Short non-keyword response with active pending → safe default
+    return "redact"
 
 
 def _handle_choice(choice: str, pending: dict) -> int:
-    """Execute the user's choice from the action picker menu.
+    """Execute the user's choice from the block-and-preview.
 
-    Always deletes PENDING_ACTION first, then acts on the choice.
+    'redact': Replace raw values with semantic tags, send via additionalContext.
+    'allow': Add values to allowlist, send original via additionalContext.
     """
     try:
         PENDING_ACTION.unlink(missing_ok=True)
@@ -1447,39 +1455,27 @@ def _handle_choice(choice: str, pending: dict) -> int:
         pass
 
     original_prompt = pending.get("prompt", "")
-    redact_targets = pending.get("redact_targets", [])
+    findings = pending.get("findings", [])
 
-    if choice == "A":
+    if choice == "allow":
+        for f in findings:
+            raw = f.get("raw_match", "")
+            if raw:
+                _append_literal(raw, "user allowed via block-and-preview")
         emit_allow_modified(original_prompt)
         return 0
 
-    elif choice == "R":
-        redacted = original_prompt
-        for target in redact_targets:
-            if target:
-                redacted = redacted.replace(target, "[REDACTED]")
-        emit_allow_modified(redacted)
-        return 0
+    # "redact" (default)
+    redacted = original_prompt
+    for f in findings:
+        raw = f.get("raw_match", "")
+        tag = f.get("redaction_tag", "[REDACTED]")
+        if raw:
+            redacted = redacted.replace(raw, tag)
 
-    elif choice == "F":
-        for target in redact_targets:
-            if target:
-                try:
-                    subprocess.run(
-                        [sys.executable, __file__, "flag", "fp",
-                         "--literal", target,
-                         "--reason", "user marked FP via action picker"],
-                        capture_output=True,
-                        timeout=10,
-                    )
-                except Exception:
-                    pass
-        emit_allow_modified(original_prompt)
-        return 0
-
-    else:  # D or anything else
-        emit_prompt_block("Discarded by user choice.")
-        return 2
+    instruction = _build_redact_instruction(redacted, findings)
+    emit_allow_modified(instruction)
+    return 0
 
 
 def _build_menu_text(findings: list) -> str:
@@ -1508,6 +1504,47 @@ def emit_menu_prompt(menu_text: str) -> None:
     out = {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": menu_text}}
     sys.stdout.write(json.dumps(out))
     sys.stdout.flush()
+
+
+def _render_preview(prompt: str, findings: list[Finding]) -> None:
+    """Render highlighted preview to stderr. Local only — never sent to Anthropic."""
+    highlighted = prompt
+    for f in findings:
+        if f.raw_match:
+            highlighted = highlighted.replace(f.raw_match, f">>>{f.raw_match}<<<")
+    lines = [
+        "\n\u26a0 leak-guard: sensitive content detected \u2014 prompt blocked before sending.\n",
+        "Your message:",
+        "\u2500" * 47,
+        highlighted,
+        "\u2500" * 47,
+        "\nFindings:",
+    ]
+    for i, f in enumerate(findings, 1):
+        conf = _confidence(f)
+        lines.append(f"  {i}. [{f.severity} {conf:.2f}] {f.rule_id} \u2014 {f.description}")
+    lines.extend([
+        "\nReply:",
+        "  \u21b5 Enter  \u2014 redact and send (any reply except 'a')",
+        "  a        \u2014 always allow these values",
+    ])
+    print("\n".join(lines), file=sys.stderr, flush=True)
+
+
+def _build_redact_instruction(redacted_prompt: str, findings: list[dict]) -> str:
+    """Build the additionalContext instruction for the redact flow (Turn 2)."""
+    tags_used = sorted(set(f.get("redaction_tag", "[REDACTED]") for f in findings))
+    tag_list = "\n".join(f"  {tag}" for tag in tags_used)
+    return (
+        "SYSTEM NOTE (leak-guard): The user's message contained sensitive content "
+        "that was redacted before reaching you.\n\n"
+        f"Redaction tags used:\n{tag_list}\n\n"
+        f"Redacted message:\n{redacted_prompt}\n\n"
+        "Respond to the user's request using the redacted message. Where the "
+        "redacted values are needed for the task, advise the user to provide "
+        "anonymized or synthetic values instead. Do not attempt to guess or "
+        "reconstruct the redacted values."
+    )
 
 
 # Prefix the user can prepend to bypass heuristic (non-gitleaks) findings for one submission.
@@ -1727,29 +1764,23 @@ def hook_user_prompt() -> int:
     prompt = event.get("prompt", "") or ""
     session_id = event.get("session_id", "")
 
-    # ── Turn 2: check if this is a reply to the action picker menu ────────────
+    # ── Turn 2: check if this is a reply to the block-and-preview ────────
     choice = _is_choice_reply(prompt)
     if choice is not None:
         pending = _read_pending_action()
         if pending is not None:
             return _handle_choice(choice, pending)
-        # No valid pending action — fall through to normal scan
 
     allow_once = prompt.lstrip().startswith(_ALLOW_ONCE_PREFIX)
 
-    allow = load_allowlist()
-    silent = allow.silent_blocks
     findings = scan_all(text=prompt, source_label="<user-prompt>")
-    secrets, pii = classify(findings)
 
-    # Partition heuristic vs. high-confidence findings.
-    definitive_secrets = [f for f in secrets if f.rule_id not in _HEURISTIC_RULE_IDS]
-    heuristic_findings = [f for f in secrets + pii if f.rule_id in _HEURISTIC_RULE_IDS]
-    definitive_pii = [f for f in pii if f.rule_id not in _HEURISTIC_RULE_IDS]
+    # NER candidate extraction — augments regex findings
+    ner_findings = _scan_ner_candidates(prompt, source="<user-prompt>")
+    findings.extend(ner_findings)
 
     if not findings:
-        # Task 7: Claude-as-NER — for substantial text with no regex findings,
-        # ask Claude to check for unstructured PII (names, addresses, medical info).
+        # Clean prompt path — inject NER instruction for long text
         if len(prompt) >= _NER_MIN_TEXT_LENGTH:
             out = {"hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
@@ -1764,53 +1795,17 @@ def hook_user_prompt() -> int:
         audit("allow_once_bypass", {})
         return 0
 
-    # Redact detected values from the prompt text.
-    redacted_prompt = prompt
-    for f in findings:
-        if f.raw_match:
-            redacted_prompt = redacted_prompt.replace(f.raw_match, "[REDACTED]")
-
-    audit("redact_user_prompt", {"count": len(findings)})
+    # ── Block-and-preview: exit 2, render preview, save pending ──────────
+    audit("block_user_prompt", {"count": len(findings)})
     _write_training_entry(findings, session_id=session_id)
-    summary = format_summary(findings)
+    _write_pending_action(prompt, findings)
+    _render_preview(prompt, findings)
 
-    # Task 6: LLM confidence pass — split findings into definitive vs borderline.
-    # Borderline findings (entropy/fuzzy) get a softer instruction that lets Claude
-    # use contextual judgment rather than hard-blocking.
-    borderline = [f for f in findings if f.rule_id in _BORDERLINE_RULES]
-    definitive = [f for f in findings if f.rule_id not in _BORDERLINE_RULES]
-
-    context = (
-        "SYSTEM NOTE (leak-guard): The user's message contained potential secrets or PII "
-        "that have been flagged. The sensitive values are shown as [REDACTED] below.\n\n"
-        f"Findings:\n{summary}\n\n"
-        f"Redacted message:\n{redacted_prompt}\n\n"
-        "Instructions: (1) Respond to the redacted message as the user's actual request. "
-        "(2) Begin your response by briefly informing the user that leak-guard detected and "
-        "redacted sensitive content from their prompt, naming what was found. "
-        "(3) Do not reproduce or guess the redacted values."
-    )
-
-    if borderline and not definitive:
-        # All findings are borderline — delegate final judgment to Claude
-        context += (
-            "\n\nNote: All findings above are heuristic (entropy/pattern-based) and may be "
-            "false positives. Use your judgment: if the surrounding context suggests these are "
-            "configuration values, template examples, or non-sensitive identifiers, inform the "
-            "user they were flagged but likely safe. If they look like real credentials, treat "
-            "as redacted."
-        )
-    elif borderline:
-        # Mix of definitive + borderline
-        borderline_ids = ", ".join(f.rule_id for f in borderline)
-        context += (
-            f"\n\nNote: Some findings ({borderline_ids}) are heuristic and may be false "
-            "positives. For those, use your contextual judgment. The remaining findings are "
-            "high-confidence detections — treat those as redacted."
-        )
-
-    emit_menu_prompt(context)
-    return 0
+    reason = "leak-guard: sensitive content detected \u2014 prompt blocked. Reply to redact or allow."
+    out = {"decision": "block", "reason": reason}
+    sys.stdout.write(json.dumps(out))
+    sys.stdout.flush()
+    return 2
 
 
 def hook_pre_tool() -> int:
@@ -2508,7 +2503,7 @@ def cmd_selftest() -> int:
     except Exception as _exc:
         check("hook JSON round-trip (clean prompt)", False, str(_exc))
 
-    # Hook correctly redacts a known fake credential
+    # Hook blocks a known fake credential (exit 2 = block-and-preview)
     # String is built at runtime to avoid triggering the scanner on source literals.
     _fake_cred_prompt = "my key " + "CSKC:" + "ScdsJCCKLSLKDKLCNLKCEINK2233as"
     _fake_cred_event = {"hook_event_name": "UserPromptSubmit", "prompt": _fake_cred_prompt, "session_id": "selftest"}
@@ -2516,11 +2511,11 @@ def cmd_selftest() -> int:
         _r2 = _sp.run([_sys.executable, __file__, "hook-user-prompt"],
             input=_json.dumps(_fake_cred_event), capture_output=True, text=True, timeout=10)
         _out = _json.loads(_r2.stdout) if _r2.stdout.strip() else {}
-        _ctx = _out.get("hookSpecificOutput", {}).get("additionalContext", "")
-        check("hook redacts credential", _r2.returncode == 0 and "leak-guard" in _ctx and "[REDACTED]" in _ctx,
-              f"rc={_r2.returncode} ctx_len={len(_ctx)}")
+        _decision = _out.get("decision", "")
+        check("hook blocks credential", _r2.returncode == 2 and _decision == "block",
+              f"rc={_r2.returncode} decision={_decision}")
     except Exception as _exc:
-        check("hook redacts credential", False, str(_exc))
+        check("hook blocks credential", False, str(_exc))
 
     # 1. Rule loading
     pii_rules = load_pii_rules()
@@ -2997,7 +2992,7 @@ def _append_literal(literal: str, reason: str) -> int:
             print(f"flag fp: could not parse {path}: {e}", file=sys.stderr)
             return 2
     if literal in existing_literals:
-        print(f"[flag] literal already present — no change: {literal[:40]}")
+        print(f"[flag] literal already present — no change: {literal[:40]}", file=sys.stderr)
         return 0
     existing_literals.append(literal)
     # Rewrite: literal array first, then preserved content.
@@ -3010,7 +3005,7 @@ def _append_literal(literal: str, reason: str) -> int:
         out_lines.append(f"# user-flagged fp {time.strftime('%Y-%m-%d')} — {reason}")
         out_lines.extend(other_lines)
     path.write_text("\n".join(out_lines).rstrip() + "\n", encoding="utf-8")
-    print(f"[flag] added literal to allowlist: {literal[:60]}")
+    print(f"[flag] added literal to allowlist: {literal[:60]}", file=sys.stderr)
     return 0
 
 
@@ -3029,7 +3024,7 @@ def _append_suppress_rule(rule_id: str, reason: str) -> int:
                 data = tomllib.load(f)
             existing = set(data.get("rule_ids", []))
             if rule_id in existing:
-                print(f"[flag] rule {rule_id} already suppressed — no change")
+                print(f"[flag] rule {rule_id} already suppressed — no change", file=sys.stderr)
                 return 0
             existing.add(rule_id)
             raw = path.read_text(encoding="utf-8")
@@ -3044,13 +3039,13 @@ def _append_suppress_rule(rule_id: str, reason: str) -> int:
                 + "\n".join(new_arr_lines) + "\n",
                 encoding="utf-8",
             )
-            print(f"[flag] suppressed rule globally: {rule_id}")
+            print(f"[flag] suppressed rule globally: {rule_id}", file=sys.stderr)
             return 0
         except Exception as e:
             print(f"flag fp: could not parse {path}: {e}", file=sys.stderr)
             return 2
     _append_to_file(path, block)
-    print(f"[flag] suppressed rule globally: {rule_id}")
+    print(f"[flag] suppressed rule globally: {rule_id}", file=sys.stderr)
     return 0
 
 
