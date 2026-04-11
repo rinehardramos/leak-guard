@@ -91,3 +91,41 @@ description = "Generic secret/credential in assignment context"
 severity = "high"
 # Matches: secret=xxx, my_secret: xxx — but NOT 'secret' as a standalone word
 regex = '''(?i)(?:^|[\s,;])(?:secret|credential|private[_-]?key|signing[_-]?key|encryption[_-]?key)[\s]*(?:=|:(?!=))\s*["']?([A-Za-z0-9+/._~-]{16,})["']?'''
+
+# ── International PII ──────────────────────────────────────────────────────
+
+[[rule]]
+id = "uk-ni-number"
+description = "UK National Insurance number"
+severity = "high"
+regex = '''(?i)\b[A-CEGHJ-PR-TW-Z]{2}\s?\d{2}\s?\d{2}\s?\d{2}\s?[A-D]\b'''
+
+[[rule]]
+id = "ca-sin"
+description = "Canadian Social Insurance Number"
+severity = "high"
+regex = '''\b\d{3}[\s-]\d{3}[\s-]\d{3}\b'''
+
+[[rule]]
+id = "au-tfn"
+description = "Australian Tax File Number (contextual)"
+severity = "high"
+regex = '''(?i)(?:tfn|tax\s*file)[^\n]{0,15}\b\d{3}\s?\d{3}\s?\d{3}\b'''
+
+[[rule]]
+id = "in-aadhaar"
+description = "Indian Aadhaar number (12 digits, contextual)"
+severity = "high"
+regex = '''(?i)(?:aadhaar|aadhar|uid)[^\n]{0,15}\b\d{4}\s?\d{4}\s?\d{4}\b'''
+
+[[rule]]
+id = "mx-curp"
+description = "Mexican CURP (18-char alphanumeric)"
+severity = "medium"
+regex = '''\b[A-Z]{4}\d{6}[HM][A-Z]{5}[A-Z0-9]\d\b'''
+
+[[rule]]
+id = "de-personalausweis"
+description = "German ID card number (contextual)"
+severity = "high"
+regex = '''(?i)(?:ausweis|personal.?id|id.?nummer)[^\n]{0,15}\b[LMNPRTVWXY][A-Z0-9]{8}\b'''

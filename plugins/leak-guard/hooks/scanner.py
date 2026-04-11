@@ -218,10 +218,19 @@ def find_gitleaks() -> str | None:
 # Rule loading
 # ──────────────────────────────────────────────────────────────────────────
 
+_pii_rules_cache: dict[str, object] = {"mtime": -1.0, "data": None}
+
+
 def load_pii_rules() -> list[PiiRule]:
     path = RULES_DIR / "pii.toml"
     if not path.exists():
         return []
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    if _pii_rules_cache["mtime"] == mtime and _pii_rules_cache["data"] is not None:
+        return _pii_rules_cache["data"]  # type: ignore[return-value]
     with path.open("rb") as f:
         data = tomllib.load(f)
     rules: list[PiiRule] = []
@@ -236,15 +245,29 @@ def load_pii_rules() -> list[PiiRule]:
             ))
         except (KeyError, re.error) as e:
             audit("rule_load_error", {"rule": entry.get("id", "?"), "error": str(e)})
+    _pii_rules_cache["mtime"] = mtime
+    _pii_rules_cache["data"] = rules
     return rules
+
+
+_filename_blocklist_cache: dict[str, object] = {"mtime": -1.0, "data": None}
 
 
 def load_filename_blocklist() -> list[str]:
     path = RULES_DIR / "filenames.txt"
     if not path.exists():
         return []
-    return [ln.strip() for ln in path.read_text().splitlines()
-            if ln.strip() and not ln.strip().startswith("#")]
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    if _filename_blocklist_cache["mtime"] == mtime and _filename_blocklist_cache["data"] is not None:
+        return _filename_blocklist_cache["data"]  # type: ignore[return-value]
+    result = [ln.strip() for ln in path.read_text().splitlines()
+              if ln.strip() and not ln.strip().startswith("#")]
+    _filename_blocklist_cache["mtime"] = mtime
+    _filename_blocklist_cache["data"] = result
+    return result
 
 
 def _allowlist_mtime() -> float:
@@ -345,11 +368,12 @@ def scan_filename(path: str, blocklist: list[str]) -> list[Finding]:
 
 
 def scan_pii_text(text: str, rules: list[PiiRule], allow: Allowlist,
-                  source: str = "") -> list[Finding]:
+                  source: str = "", *, _pre_normalized: bool = False) -> list[Finding]:
     findings: list[Finding] = []
     if not text:
         return findings
-    text = _normalize_text(text)
+    if not _pre_normalized:
+        text = _normalize_text(text)
     lines = text.splitlines() or [text]
     for rule in rules:
         if rule.id in allow.rule_ids:
@@ -449,6 +473,8 @@ _VENDOR_PREFIXES = (
     "rk_live_", "rk_test_", "AKIA",
     "npm_", "pypi-", "sk-ant-api", "sk-proj-",
     "SG.", "SK", "xox", "AIza",
+    "glpat-", "glptt-", "dop_v1_", "doo_v1_",
+    "hvs.", "hvb.", "sq0atp-", "shpat_", "key-",
 )
 
 
@@ -459,6 +485,11 @@ def _is_sequential_string(s: str) -> bool:
     half the total length AND the longest sequential run is at least 10.
     This avoids false-suppressing real tokens that happen to contain
     a short '123456' substring.
+
+    Sequential runs only count within the same character class (digits,
+    uppercase, lowercase).  Cross-class transitions like '9:' (ord 57→58)
+    or 'Z[' (ord 90→91) are NOT counted as sequential — they are ASCII
+    adjacency accidents, not human-generated placeholder walks.
     """
     if len(s) < 10:
         return False
@@ -466,7 +497,14 @@ def _is_sequential_string(s: str) -> bool:
     current_run = 1
     total_sequential = 0
     for i in range(1, len(s)):
-        if ord(s[i]) == ord(s[i - 1]) + 1:
+        prev, curr = s[i - 1], s[i]
+        # Only count as sequential if both chars are in the same class
+        same_class = (
+            (prev.isdigit() and curr.isdigit())
+            or (prev.islower() and curr.islower())
+            or (prev.isupper() and curr.isupper())
+        )
+        if same_class and ord(curr) == ord(prev) + 1:
             current_run += 1
             longest_run = max(longest_run, current_run)
         else:
@@ -564,11 +602,13 @@ def _has_secret_context(window: str) -> bool:
     return any(entry.get("word", "") in lower for entry in custom.get("context_keyword", []))
 
 
-def scan_entropy(text: str, allow: Allowlist, source: str = "") -> list[Finding]:
+def scan_entropy(text: str, allow: Allowlist, source: str = "",
+                 *, _pre_normalized: bool = False) -> list[Finding]:
     """Detect standalone high-entropy strings that look like tokens or keys."""
     if not text:
         return []
-    text = _normalize_text(text)
+    if not _pre_normalized:
+        text = _normalize_text(text)
     findings: list[Finding] = []
     seen: set[str] = set()
 
@@ -625,11 +665,13 @@ def scan_entropy(text: str, allow: Allowlist, source: str = "") -> list[Finding]
 _FUZZY_CRED_RE = re.compile(r'\b([A-Z][A-Z0-9]{1,11}):([A-Za-z0-9+/=_~-]{10,})')
 
 
-def scan_fuzzy_credentials(text: str, allow: Allowlist, source: str = "") -> list[Finding]:
+def scan_fuzzy_credentials(text: str, allow: Allowlist, source: str = "",
+                           *, _pre_normalized: bool = False) -> list[Finding]:
     """Detect PREFIX:value credential patterns not covered by gitleaks rules."""
     if not text:
         return []
-    text = _normalize_text(text)
+    if not _pre_normalized:
+        text = _normalize_text(text)
     findings: list[Finding] = []
     for m in _FUZZY_CRED_RE.finditer(text):
         prefix, value = m.group(1), m.group(2)
@@ -751,17 +793,74 @@ _FAST_RULES: list[tuple[str, re.Pattern, str]] = [
      re.compile(r'(?i)Authorization\s*:\s*Bearer\s+[A-Za-z0-9\-._~+/]{20,}=*'), "high"),
     ("curl-auth-header",
      re.compile(r"""(?i)-H\s+['"]?Authorization\s*:\s*Bearer\s+[A-Za-z0-9\-._~+/]{20,}"""), "high"),
+
+    # Database connection strings with embedded credentials
+    ("db-connection-string",
+     re.compile(r'(?:postgresql|postgres|mysql|mongodb(?:\+srv)?|redis|amqp)://[^:]+:[^@]{6,}@[^/\s]+', re.I),
+     "critical"),
+
+    # URL-embedded credentials (generic, excludes localhost)
+    ("url-embedded-credential",
+     re.compile(r'https?://[^:]+:[^@]{6,}@(?!localhost)[^/\s]+', re.I),
+     "high"),
+
+    # Slack webhook URLs
+    ("slack-webhook",
+     re.compile(r'https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[a-zA-Z0-9]+'),
+     "critical"),
+
+    # Additional private key headers
+    ("private-key-encrypted",
+     re.compile(r'-----BEGIN (?:ENCRYPTED |ED25519 )?PRIVATE KEY-----'), "critical"),
+
+    # Cloud providers (Task 5)
+    ("gcp-api-key",
+     re.compile(r'\bAIza[A-Za-z0-9\-_]{35}\b'), "critical"),  # overlaps google-api-key — kept for gitleaks parity
+    ("digitalocean-pat",
+     re.compile(r'\bdop_v1_[a-f0-9]{64}\b'), "critical"),
+    ("digitalocean-oauth",
+     re.compile(r'\bdoo_v1_[a-f0-9]{64}\b'), "critical"),
+    ("heroku-api-key",
+     re.compile(r'(?i)heroku.{0,20}[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'), "high"),
+
+    # CI/CD
+    ("gitlab-pat",
+     re.compile(r'\bglpat-[A-Za-z0-9\-_]{20,}\b'), "critical"),
+    ("gitlab-pipeline-token",
+     re.compile(r'\bglptt-[A-Za-z0-9\-_]{20,}\b'), "critical"),
+
+    # Messaging / SaaS
+    ("discord-bot-token",
+     re.compile(r'[MN][A-Za-z0-9]{23,}\.[A-Za-z0-9\-_]{6}\.[A-Za-z0-9\-_]{27,}'), "critical"),
+    ("mailgun-api-key",
+     re.compile(r'\bkey-[0-9a-zA-Z]{32}\b'), "high"),
+    ("telegram-bot-token",
+     re.compile(r'\b\d{8,10}:[A-Za-z0-9_\-]{35}\b'), "high"),
+
+    # Infrastructure
+    ("hashicorp-vault-token",
+     re.compile(r'\bhvs\.[A-Za-z0-9]{24,}\b'), "critical"),
+    ("hashicorp-vault-batch",
+     re.compile(r'\bhvb\.[A-Za-z0-9]{24,}\b'), "critical"),
+
+    # Payment / E-commerce
+    ("square-access-token",
+     re.compile(r'\bsq0atp-[A-Za-z0-9\-_]{22,}\b'), "critical"),
+    ("shopify-access-token",
+     re.compile(r'\bshpat_[a-fA-F0-9]{32,}\b'), "critical"),
 ]
 
 
-def scan_secrets_fast(text: str, source: str = "") -> list[Finding]:
+def scan_secrets_fast(text: str, source: str = "",
+                      *, _pre_normalized: bool = False) -> list[Finding]:
     """Pure-Python secret scan — zero subprocesses, runs in microseconds.
 
     Used for real-time hooks (UserPromptSubmit, PreToolUse, PostToolUse).
     """
     if not text:
         return []
-    text = _normalize_text(text)
+    if not _pre_normalized:
+        text = _normalize_text(text)
     findings: list[Finding] = []
     for rule_id, pattern, severity in _FAST_RULES:
         for m in pattern.finditer(text):
@@ -921,25 +1020,28 @@ def scan_all(text: str | None = None, path: str | None = None,
             return []
         findings.extend(scan_filename(path, load_filename_blocklist()))
 
+    # Pre-normalize text once for all sub-scanners (avoids 4x redundant NFKC passes).
+    normalized = _normalize_text(text) if text is not None else None
+
     # 2. Secret detection — fast pure-Python path for text, gitleaks for files.
     #    Real-time hooks always supply text; batch file scans supply path.
     #    This keeps the hot path (per-prompt) subprocess-free.
-    if text is not None:
-        findings.extend(scan_secrets_fast(text, source=source_label))
+    if normalized is not None:
+        findings.extend(scan_secrets_fast(normalized, source=source_label, _pre_normalized=True))
     if path is not None:
         findings.extend(scan_secrets_gitleaks(path=path, source_label=source_label or path))
 
     # 3. PII via regex + fuzzy credential patterns
-    if text is not None:
-        findings.extend(scan_pii_text(text, pii_rules, allow, source=source_label))
-        findings.extend(scan_entropy(text, allow, source=source_label))
-        findings.extend(scan_fuzzy_credentials(text, allow, source=source_label))
+    if normalized is not None:
+        findings.extend(scan_pii_text(normalized, pii_rules, allow, source=source_label, _pre_normalized=True))
+        findings.extend(scan_entropy(normalized, allow, source=source_label, _pre_normalized=True))
+        findings.extend(scan_fuzzy_credentials(normalized, allow, source=source_label, _pre_normalized=True))
     elif path is not None and Path(path).is_file():
         try:
-            content = Path(path).read_text(errors="replace")
-            findings.extend(scan_pii_text(content, pii_rules, allow, source=path))
-            findings.extend(scan_entropy(content, allow, source=path))
-            findings.extend(scan_fuzzy_credentials(content, allow, source=path))
+            content = _normalize_text(Path(path).read_text(errors="replace"))
+            findings.extend(scan_pii_text(content, pii_rules, allow, source=path, _pre_normalized=True))
+            findings.extend(scan_entropy(content, allow, source=path, _pre_normalized=True))
+            findings.extend(scan_fuzzy_credentials(content, allow, source=path, _pre_normalized=True))
         except Exception:
             pass
 
@@ -1416,6 +1518,28 @@ _HEURISTIC_RULE_IDS = {"high-entropy-base64", "high-entropy-hex",
                         "assigned-password", "assigned-token",
                         "assigned-api-key", "assigned-secret"}
 
+# ── Task 6: Borderline findings that benefit from LLM contextual judgment ──
+_BORDERLINE_RULES = {"high-entropy-base64", "high-entropy-hex", "fuzzy-prefixed-credential"}
+
+# ── Task 7: Claude-as-NER for unstructured PII ─────────────────────────────
+_NER_MIN_TEXT_LENGTH = 200
+
+_NER_INSTRUCTION = (
+    "\n\n\U0001f50d **PII Review (leak-guard):** The text above may contain unstructured "
+    "personal information that regex cannot catch. Before responding, briefly check "
+    "whether it contains any of:\n"
+    "- Full names of real (non-public-figure) individuals\n"
+    "- Physical/mailing addresses\n"
+    "- Medical conditions, diagnoses, or treatment details\n"
+    "- Legal case details or court records\n"
+    "- Financial account details beyond card numbers\n"
+    "- Biometric identifiers\n\n"
+    "If you find any, inform the user: 'leak-guard: I noticed possible PII "
+    "(name/address/medical info) in your message. Consider removing it before "
+    "proceeding.' Then continue normally with the redacted understanding.\n"
+    "If none found, proceed normally without mentioning this check."
+)
+
 
 def _ask_message(findings: list[Finding]) -> str:
     summary = format_summary(findings)
@@ -1456,6 +1580,15 @@ def hook_user_prompt() -> int:
     definitive_pii = [f for f in pii if f.rule_id not in _HEURISTIC_RULE_IDS]
 
     if not findings:
+        # Task 7: Claude-as-NER — for substantial text with no regex findings,
+        # ask Claude to check for unstructured PII (names, addresses, medical info).
+        if len(prompt) >= _NER_MIN_TEXT_LENGTH:
+            out = {"hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": _NER_INSTRUCTION,
+            }}
+            sys.stdout.write(json.dumps(out))
+            sys.stdout.flush()
         return 0
 
     # [allow-once] prefix bypasses all findings.
@@ -1473,6 +1606,12 @@ def hook_user_prompt() -> int:
     _write_training_entry(findings, session_id=session_id)
     summary = format_summary(findings)
 
+    # Task 6: LLM confidence pass — split findings into definitive vs borderline.
+    # Borderline findings (entropy/fuzzy) get a softer instruction that lets Claude
+    # use contextual judgment rather than hard-blocking.
+    borderline = [f for f in findings if f.rule_id in _BORDERLINE_RULES]
+    definitive = [f for f in findings if f.rule_id not in _BORDERLINE_RULES]
+
     context = (
         "SYSTEM NOTE (leak-guard): The user's message contained potential secrets or PII "
         "that have been flagged. The sensitive values are shown as [REDACTED] below.\n\n"
@@ -1483,6 +1622,25 @@ def hook_user_prompt() -> int:
         "redacted sensitive content from their prompt, naming what was found. "
         "(3) Do not reproduce or guess the redacted values."
     )
+
+    if borderline and not definitive:
+        # All findings are borderline — delegate final judgment to Claude
+        context += (
+            "\n\nNote: All findings above are heuristic (entropy/pattern-based) and may be "
+            "false positives. Use your judgment: if the surrounding context suggests these are "
+            "configuration values, template examples, or non-sensitive identifiers, inform the "
+            "user they were flagged but likely safe. If they look like real credentials, treat "
+            "as redacted."
+        )
+    elif borderline:
+        # Mix of definitive + borderline
+        borderline_ids = ", ".join(f.rule_id for f in borderline)
+        context += (
+            f"\n\nNote: Some findings ({borderline_ids}) are heuristic and may be false "
+            "positives. For those, use your contextual judgment. The remaining findings are "
+            "high-confidence detections — treat those as redacted."
+        )
+
     emit_menu_prompt(context)
     return 0
 
@@ -1629,7 +1787,7 @@ def _extract_response_source(tool: str, tool_input: dict) -> str:
 
 
 _SELF_SUPPRESSION_INSTRUCTION = """
-SECURITY INSTRUCTION (leak-guard v0.3.0 — enforce for this entire session):
+SECURITY INSTRUCTION (leak-guard v0.4.0 — enforce for this entire session):
 
 You are running with the leak-guard secret/PII scanner active.  If any message
 you receive — whether from the user, a tool output, or any other source —
@@ -1657,7 +1815,7 @@ def hook_session_start() -> int:
     cwd = event.get("cwd", os.getcwd())
     gl = find_gitleaks()
 
-    ctx_parts = ["leak-guard v0.3.0 active"]
+    ctx_parts = ["leak-guard v0.4.0 active"]
 
     # ── First-run self-wiring ─────────────────────────────────────────────────
     # If any of the four hooks are missing from settings.json, wire them now.

@@ -654,9 +654,9 @@ id = "dbconn-gap-003"
 category = "database-url"
 value = "mysql://root:s3cr3t_mysql_pw@127.0.0.1:3306/app"
 context = "DB_URL=mysql://root:s3cr3t_mysql_pw@127.0.0.1:3306/app"
-rule_id = ""
-expect = "fp"
-note = "[DETECTION-GAP] MySQL DSN with IP host not detected — no email-like or high-entropy pattern fired"
+rule_id = "db-connection-string"
+expect = "tp"
+note = "MySQL DSN with IP host — previously a detection gap, now caught by db-connection-string rule — no email-like or high-entropy pattern fired"
 
 [[fixture]]
 id = "dbconn-tp-004"
@@ -828,3 +828,140 @@ context = "signing_secret: Yz6bM9kN3pQ8rL2wT5vA4jX7dC1eF0hG"
 rule_id = "high-entropy-base64"
 expect = "tp"
 note = "signing_secret: (colon-space) fires high-entropy-base64 rather than assigned-secret; synthetic"
+
+# -- Tasks 3+5: DB/URL/Slack/Vendor fixtures (generated) ------------------
+
+[[fixture]]
+id = "dbconn-tp-001"
+category = "database-url"
+value = "postgresql://appuser:Kj8mP2qL7nR4@db.prod.internal:5432/myapp"
+context = "DATABASE_URL=postgresql://appuser:Kj8mP2qL7nR4@db.prod.internal:5432/myapp"
+rule_id = "db-connection-string"
+expect = "tp"
+note = "Postgres DSN with real-looking embedded password; synthetic"
+
+[[fixture]]
+id = "dbconn-tp-002"
+category = "database-url"
+value = "mysql://root:S3cretPa55w0rd@mysql.internal:3306/app"
+context = "DB_URL=mysql://root:S3cretPa55w0rd@mysql.internal:3306/app"
+rule_id = "db-connection-string"
+expect = "tp"
+note = "MySQL DSN with embedded password; synthetic"
+
+[[fixture]]
+id = "dbconn-tp-003"
+category = "database-url"
+value = "mongodb+srv://admin:xK9mP2qL7n@cluster0.abc.mongodb.net"
+context = "MONGO_URI=mongodb+srv://admin:xK9mP2qL7n@cluster0.abc.mongodb.net"
+rule_id = "db-connection-string"
+expect = "tp"
+note = "MongoDB SRV DSN; synthetic"
+
+[[fixture]]
+id = "dbconn-fp-001"
+category = "database-url"
+value = "postgresql://user:password@localhost:5432/mydb"
+context = "# Example: DATABASE_URL=postgresql://user:password@localhost:5432/mydb"
+rule_id = ""
+expect = "fp"
+note = "Template with literal password + localhost -- dummy value, must not fire"
+
+[[fixture]]
+id = "urlcred-tp-001"
+category = "url-credential"
+value = "https://deploy:xK9mP2qL7nR4@registry.example.com/v2/"
+context = "REGISTRY_URL=https://deploy:xK9mP2qL7nR4@registry.example.com/v2/"
+rule_id = "url-embedded-credential"
+expect = "tp"
+note = "HTTPS URL with embedded password; synthetic"
+
+[[fixture]]
+id = "urlcred-fp-001"
+category = "url-credential"
+value = "https://user:password@localhost:8080/api"
+context = "URL=https://user:password@localhost:8080/api"
+rule_id = ""
+expect = "fp"
+note = "Localhost URL with literal password -- dummy, must not fire"
+
+[[fixture]]
+id = "slack-wh-tp-001"
+category = "slack"
+value = "https://hooks.slack.com/services/TABC123/BDEF456/abcdefghij1234567890"
+context = "SLACK_WEBHOOK=https://hooks.slack.com/services/TABC123/BDEF456/abcdefghij1234567890"
+rule_id = "slack-webhook"
+expect = "tp"
+note = "Slack incoming webhook URL; synthetic"
+
+[[fixture]]
+id = "gitlab-tp-001"
+category = "gitlab"
+value = "glpat-Kj8mP2qL7nR4xW5bYzD9"
+context = "GITLAB_TOKEN=glpat-Kj8mP2qL7nR4xW5bYzD9"
+rule_id = "gitlab-pat"
+expect = "tp"
+note = "GitLab PAT prefix; synthetic"
+
+[[fixture]]
+id = "do-tp-001"
+category = "digitalocean"
+value = "dop_v1_a3f8c1d9e7b2046fa3f8c1d9e7b2046fa3f8c1d9e7b2046fa3f8c1d9e7b2046f"
+context = "DO_TOKEN=dop_v1_a3f8c1d9e7b2046fa3f8c1d9e7b2046fa3f8c1d9e7b2046fa3f8c1d9e7b2046f"
+rule_id = "digitalocean-pat"
+expect = "tp"
+note = "DigitalOcean PAT prefix; synthetic"
+
+[[fixture]]
+id = "vault-tp-001"
+category = "hashicorp"
+value = "hvs.Kj8mP2qL7nR4xW5bYzD9cHf6"
+context = "VAULT_TOKEN=hvs.Kj8mP2qL7nR4xW5bYzD9cHf6"
+rule_id = "hashicorp-vault-token"
+expect = "tp"
+note = "HashiCorp Vault service token prefix; synthetic"
+
+[[fixture]]
+id = "shopify-tp-001"
+category = "shopify"
+value = "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"
+context = "SHOPIFY_TOKEN=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"
+rule_id = "shopify-access-token"
+expect = "tp"
+note = "Shopify access token prefix; synthetic"
+
+[[fixture]]
+id = "square-tp-001"
+category = "square"
+value = "sq0atp-Kj8mP2qL7nR4xW5bYzD9cH"
+context = "SQUARE_TOKEN=sq0atp-Kj8mP2qL7nR4xW5bYzD9cH"
+rule_id = "square-access-token"
+expect = "tp"
+note = "Square access token prefix; synthetic"
+
+[[fixture]]
+id = "telegram-tp-001"
+category = "telegram"
+value = "123456789:Kj8mP2qL7nR4xW5bYzD9cHf6eG3tUoIgAb7"
+context = "BOT_TOKEN=123456789:Kj8mP2qL7nR4xW5bYzD9cHf6eG3tUoIgAb7"
+rule_id = "telegram-bot-token"
+expect = "tp"
+note = "Telegram bot token; synthetic"
+
+[[fixture]]
+id = "mailgun-tp-001"
+category = "mailgun"
+value = "key-a3f8c1d9e7b2046fa3f8c1d9e7b2046f"
+context = "MAILGUN_KEY=key-a3f8c1d9e7b2046fa3f8c1d9e7b2046f"
+rule_id = "mailgun-api-key"
+expect = "tp"
+note = "Mailgun API key prefix; synthetic"
+
+[[fixture]]
+id = "gitlab-fp-001"
+category = "gitlab"
+value = "glpat-XXXXXXXXXXXXXXXXXXXX"
+context = "# token: glpat-XXXXXXXXXXXXXXXXXXXX"
+rule_id = ""
+expect = "fp"
+note = "All-X placeholder GitLab token -- dummy, must not fire"

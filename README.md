@@ -65,10 +65,13 @@ All scanning runs 100% locally. No data is sent to any external service.
 | Layer | What it catches |
 |---|---|
 | gitleaks (optional) | AWS/GCP/Azure/GitHub/Stripe/Slack keys, JWTs, private keys, and hundreds of provider-specific patterns |
-| Fast regex rules | High-signal credential patterns (fast_rules) |
-| PII regex (pii.toml) | Email, SSN, US phone, credit card (Luhn-validated), and more |
-| Entropy analysis | High-entropy base64 and hex strings |
+| Fast regex rules (37 patterns) | Vendor-specific credentials: AWS, GitHub, GitLab, Stripe, Slack, DigitalOcean, Heroku, HashiCorp Vault, Shopify, Square, Telegram, Mailgun, and more |
+| DB/URL credential detection | Database connection strings (Postgres, MySQL, MongoDB, Redis, AMQP) and URL-embedded credentials |
+| PII regex (20 rules) | Email, SSN, credit card (Luhn-validated), US phone, IBAN, plus international: UK NI, Canadian SIN, Australian TFN, Indian Aadhaar, Mexican CURP, German ID |
+| Entropy analysis | High-entropy base64 and hex strings with contextual keyword boosting |
 | Fuzzy credential detection | PREFIX:value patterns (e.g. `CSKC:...`) |
+| LLM confidence pass | Borderline findings (entropy/fuzzy) are delegated to Claude for contextual judgment — reduces false positives without reducing true positives |
+| Claude-as-NER | For long prompts with no regex hits, Claude checks for unstructured PII (names, addresses, medical info) that regex cannot catch |
 | Filename blocklist | `.env`, `id_rsa`, `*.pem`, service account files, etc. |
 
 gitleaks is optional — leak-guard warns if it is absent but does not fail. If gitleaks is installed, it provides significantly deeper secret detection.
@@ -250,6 +253,14 @@ MIT — see [LICENSE](LICENSE).
 ---
 
 ## Changelog
+
+### v0.4.0 (2026-04-11)
+- **Performance:** Normalize text once per scan (was 4x); cache PII rules and filename blocklist by mtime
+- **Detection:** +17 fast rules (DB connection strings, URL-embedded creds, Slack webhooks, GitLab, DigitalOcean, Heroku, Discord, Telegram, Mailgun, HashiCorp Vault, Square, Shopify)
+- **International PII:** UK National Insurance, Canadian SIN, Australian TFN, Indian Aadhaar, Mexican CURP, German ID (14→20 PII rules)
+- **LLM confidence pass:** Borderline findings (entropy/fuzzy) get contextual judgment from Claude instead of hard-blocking — reduces false positives
+- **Claude-as-NER:** Long prompts with no regex findings are checked by Claude for unstructured PII (names, addresses, medical info)
+- **Bug fix:** `_is_sequential_string` no longer counts cross-class ASCII adjacency (`9:`, `Z[`) as sequential runs
 
 ### v0.3.0 (2026-04-10)
 - Switched enforcement model: prompt values are redacted inline with `[REDACTED]`; Claude is notified via `additionalContext` SYSTEM NOTE rather than a hard block

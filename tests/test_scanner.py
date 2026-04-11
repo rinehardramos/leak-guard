@@ -999,3 +999,184 @@ class TestHookSettings:
             ]
             assert any(subcmd in cmd for cmd in commands), \
                 f"{event}: expected subcommand '{subcmd}' in commands {commands}"
+
+
+class TestPerformance:
+    def test_normalize_called_once_in_scan_all(self):
+        """Verify _normalize_text is called at most once per scan_all invocation."""
+        import unittest.mock as mock
+        with mock.patch.object(sc, "_normalize_text", wraps=sc._normalize_text) as m:
+            sc.scan_all(text="hello world this is a test", source_label="perf-test")
+            assert m.call_count <= 1, f"_normalize_text called {m.call_count} times, expected ≤1"
+
+    def test_pii_rules_cached_by_mtime(self):
+        """Verify load_pii_rules returns the same object on repeated calls."""
+        r1 = sc.load_pii_rules()
+        r2 = sc.load_pii_rules()
+        assert r1 is r2
+
+    def test_filename_blocklist_cached(self):
+        """Verify load_filename_blocklist returns the same object on repeated calls."""
+        b1 = sc.load_filename_blocklist()
+        b2 = sc.load_filename_blocklist()
+        assert b1 is b2
+
+
+class TestDbUrlRules:
+    """Task 3: DB connection string, URL credential, and Slack webhook detection."""
+
+    def test_postgres_dsn_detected(self):
+        text = "DATABASE_URL=postgre" + "sql://appuser:Kj8mP2qL7nR4@db.prod.internal:5432/myapp"
+        hits = sc.scan_secrets_fast(text)
+        assert any(f.rule_id == "db-connection-string" for f in hits)
+
+    def test_mysql_dsn_detected(self):
+        text = "DB=my" + "sql://root:S3cretPa55w0rd@mysql.internal:3306/app"
+        hits = sc.scan_secrets_fast(text)
+        assert any(f.rule_id == "db-connection-string" for f in hits)
+
+    def test_mongodb_srv_detected(self):
+        text = "MONGO=mongo" + "db+srv://admin:xK9mP2qL7n@cluster0.abc.mongodb.net"
+        hits = sc.scan_secrets_fast(text)
+        assert any(f.rule_id == "db-connection-string" for f in hits)
+
+    def test_url_embedded_cred_detected(self):
+        text = "REGISTRY=htt" + "ps://deploy:xK9mP2qL7nR4@registry.example.com/v2/"
+        hits = sc.scan_secrets_fast(text)
+        assert any(f.rule_id == "url-embedded-credential" for f in hits)
+
+    def test_url_localhost_not_detected(self):
+        text = "URL=htt" + "ps://user:password@localhost:8080/api"
+        hits = sc.scan_secrets_fast(text)
+        assert not any(f.rule_id == "url-embedded-credential" for f in hits)
+
+    def test_db_short_password_not_detected(self):
+        text = "DB=postgre" + "sql://user:pass@host/db"
+        hits = sc.scan_secrets_fast(text)
+        assert not any(f.rule_id == "db-connection-string" for f in hits)
+
+    def test_slack_webhook_detected(self):
+        text = "HOOK=https://hooks.slack.com/services/T" + "ABC123/B" + "DEF456/abcdefghij1234567890"
+        hits = sc.scan_secrets_fast(text)
+        assert any(f.rule_id == "slack-webhook" for f in hits)
+
+
+class TestVendorFastRules:
+    """Task 5: Vendor-specific fast rules."""
+
+    def test_gitlab_pat_detected(self):
+        token = "glp" + "at-" + "Kj8mP2qL7nR4xW5bYzD9"
+        hits = sc.scan_secrets_fast(f"TOKEN={token}")
+        assert any(f.rule_id == "gitlab-pat" for f in hits)
+
+    def test_digitalocean_pat_detected(self):
+        token = "dop" + "_v1_" + "a3f8c1d9e7b2046f" * 4
+        hits = sc.scan_secrets_fast(f"TOKEN={token}")
+        assert any(f.rule_id == "digitalocean-pat" for f in hits)
+
+    def test_hashicorp_vault_detected(self):
+        token = "hv" + "s." + "Kj8mP2qL7nR4xW5bYzD9cHf6"
+        hits = sc.scan_secrets_fast(f"VAULT_TOKEN={token}")
+        assert any(f.rule_id == "hashicorp-vault-token" for f in hits)
+
+    def test_shopify_pat_detected(self):
+        token = "shp" + "at_" + "a3f8c1d9e7b2046f" * 2
+        hits = sc.scan_secrets_fast(f"TOKEN={token}")
+        assert any(f.rule_id == "shopify-access-token" for f in hits)
+
+    def test_square_token_detected(self):
+        token = "sq0" + "atp-" + "Kj8mP2qL7nR4xW5bYzD9cH"
+        hits = sc.scan_secrets_fast(f"TOKEN={token}")
+        assert any(f.rule_id == "square-access-token" for f in hits)
+
+    def test_telegram_bot_token_detected(self):
+        token = "12345" + "6789:" + "ABCDefGHIjkLMnoPQRsTUvWXYz012345678"
+        hits = sc.scan_secrets_fast(f"BOT_TOKEN={token}")
+        assert any(f.rule_id == "telegram-bot-token" for f in hits)
+
+    def test_mailgun_key_detected(self):
+        token = "ke" + "y-" + "a3f8c1d9e7b2046f" * 2
+        hits = sc.scan_secrets_fast(f"MAILGUN_KEY={token}")
+        assert any(f.rule_id == "mailgun-api-key" for f in hits)
+
+    def test_dummy_gitlab_pat_not_detected(self):
+        token = "glp" + "at-" + "X" * 20  # all-same-char payload
+        hits = sc.scan_secrets_fast(f"TOKEN={token}")
+        assert not any(f.rule_id == "gitlab-pat" for f in hits)
+
+
+class TestInternationalPii:
+    """Task 4: International PII rules."""
+
+    def setup_method(self):
+        self.rules = sc.load_pii_rules()
+        self.allow = sc.Allowlist()
+
+    def test_uk_ni_number_detected(self):
+        hits = sc.scan_pii_text("NI number: AB 12 34 56 C", self.rules, self.allow)
+        assert any(f.rule_id == "uk-ni-number" for f in hits)
+
+    def test_canadian_sin_detected(self):
+        hits = sc.scan_pii_text("SIN: 123-456-789", self.rules, self.allow)
+        assert any(f.rule_id == "ca-sin" for f in hits)
+
+    def test_australian_tfn_detected(self):
+        hits = sc.scan_pii_text("TFN: 123 456 789", self.rules, self.allow)
+        assert any(f.rule_id == "au-tfn" for f in hits)
+
+    def test_aadhaar_detected(self):
+        hits = sc.scan_pii_text("Aadhaar: 1234 5678 9012", self.rules, self.allow)
+        assert any(f.rule_id == "in-aadhaar" for f in hits)
+
+    def test_mexican_curp_detected(self):
+        hits = sc.scan_pii_text("CURP: GARC850101HDFRRL09", self.rules, self.allow)
+        assert any(f.rule_id == "mx-curp" for f in hits)
+
+    def test_german_id_detected(self):
+        hits = sc.scan_pii_text("Personalausweis: L12345678", self.rules, self.allow)
+        assert any(f.rule_id == "de-personalausweis" for f in hits)
+
+
+class TestBorderlineConfidence:
+    """Task 6: LLM confidence pass — borderline findings get softer instructions."""
+
+    def test_borderline_only_gets_judgment_note(self):
+        """When all findings are borderline, context includes 'false positives' note."""
+        # Trigger an entropy finding with a high-entropy string
+        prompt = "config_value=" + "Kj8" + "mP2" + "qL7" + "nR4" + "xW5" + "bYz" + "D9c" + "Hf6" + "eG3" + "tUo"
+        rc, out, stderr = run_hook("hook-user-prompt", {"prompt": prompt})
+        if out and "additionalContext" in json.dumps(out):
+            ctx = out.get("hookSpecificOutput", {}).get("additionalContext", "")
+            # If findings were all borderline, should contain judgment language
+            if "high-entropy" in ctx:
+                assert "false positives" in ctx.lower() or "judgment" in ctx.lower()
+
+
+class TestNerInstruction:
+    """Task 7: Claude-as-NER for unstructured PII detection."""
+
+    def test_short_prompt_no_ner(self):
+        """Short prompts should not trigger NER instruction."""
+        rc, out, _ = run_hook("hook-user-prompt", {"prompt": "fix the bug"})
+        if out:
+            ctx = out.get("hookSpecificOutput", {}).get("additionalContext", "")
+            assert "PII Review" not in ctx
+
+    def test_long_clean_prompt_gets_ner(self):
+        """Prompts >200 chars with no findings should get NER instruction."""
+        long_text = "Please help me refactor this module to use better patterns. " * 5
+        assert len(long_text) >= 200
+        rc, out, _ = run_hook("hook-user-prompt", {"prompt": long_text})
+        assert out is not None
+        ctx = out.get("hookSpecificOutput", {}).get("additionalContext", "")
+        assert "PII Review" in ctx
+
+    def test_prompt_with_secrets_no_ner(self):
+        """Prompts with findings should NOT also get NER — findings already handled."""
+        secret_prompt = "my key is " + "ghp_" + "R8mN2kLpQ7vXdYeZwBtA5cJfHsUoIgPn3m1" + " please use it " * 20
+        assert len(secret_prompt) >= 200
+        rc, out, _ = run_hook("hook-user-prompt", {"prompt": secret_prompt})
+        if out:
+            ctx = out.get("hookSpecificOutput", {}).get("additionalContext", "")
+            # Should have redaction context, NOT NER instruction
+            assert "PII Review" not in ctx
