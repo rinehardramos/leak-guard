@@ -1789,6 +1789,15 @@ def cmd_install_plugin() -> int:
     # Count PASS lines for a terse summary
     passes = result.stdout.count("[PASS]")
     print(f"  selftest: {passes} checks OK ✓")
+
+    # ── Wire Claude Code hooks into settings.json ─────────────────────────
+    installed_scanner_str = str(installed_scanner)
+    hook_rc = cmd_hook_settings(scanner_path=installed_scanner_str)
+    if hook_rc != 0:
+        print("leak-guard install: hook wiring failed — run manually: "
+              f"python3 {installed_scanner_str} hook-settings", file=sys.stderr)
+        # Non-fatal: file sync succeeded; return 0 so install doesn't abort
+
     print("  Restart Claude Code (or reload the session) for changes to take effect.")
     return 0
 
@@ -2775,6 +2784,7 @@ def main(argv: list[str]) -> int:
     sub.add_parser("scan-text")
     sub.add_parser("install-githook")
     sub.add_parser("install", help="Sync plugin source into the Claude Code plugin cache")
+    sub.add_parser("hook-settings", help="Wire Claude Code hooks into ~/.claude/settings.json")
     sub.add_parser("git-hook-pre-push")
     sub.add_parser("selftest")
 
@@ -2857,6 +2867,8 @@ def main(argv: list[str]) -> int:
             return cmd_install_githook()
         if args.cmd == "install":
             return cmd_install_plugin()
+        if args.cmd == "hook-settings":
+            return cmd_hook_settings()
         if args.cmd == "git-hook-pre-push":
             return cmd_git_hook_pre_push()
         if args.cmd == "selftest":
