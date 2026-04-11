@@ -1793,6 +1793,129 @@ def cmd_install_plugin() -> int:
     return 0
 
 
+def cmd_hook_settings(
+    settings_path: "Path | None" = None,
+    scanner_path: str = "",
+) -> int:
+    """Idempotently wire all four Claude Code hooks into settings.json.
+
+    Args:
+        settings_path: Override for ~/.claude/settings.json (used in tests).
+        scanner_path:  Override for the scanner path written into hook commands.
+                       Defaults to this file's resolved absolute path.
+    Returns 0 on success, 2 on error.
+    """
+    import json as _json
+
+    if settings_path is None:
+        settings_path = Path.home() / ".claude" / "settings.json"
+
+    if not scanner_path:
+        scanner_path = str(Path(__file__).resolve())
+
+    # Resolve the python interpreter: prefer the one running this script.
+    python = sys.executable
+
+    # ── Load existing settings ────────────────────────────────────────────
+    if settings_path.exists():
+        try:
+            data = _json.loads(settings_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"leak-guard: could not parse {settings_path}: {exc}", file=sys.stderr)
+            return 2
+    else:
+        data = {}
+
+    hooks = data.setdefault("hooks", {})
+
+    # ── Helper: add one hook entry idempotently ───────────────────────────
+    def _add_hook(event: str, entry: dict, dedup_key: str) -> None:
+        """Append entry to hooks[event] unless a leak-guard entry already exists.
+
+        dedup_key: substring that uniquely identifies this hook's command.
+        """
+        bucket = hooks.setdefault(event, [])
+        # Check for existing leak-guard entry by scanning all commands
+        for existing_entry in bucket:
+            for h in existing_entry.get("hooks", []):
+                if dedup_key in h.get("command", ""):
+                    return  # already present — skip
+        bucket.append(entry)
+
+    # ── UserPromptSubmit ──────────────────────────────────────────────────
+    _add_hook(
+        "UserPromptSubmit",
+        {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": f"{python} {scanner_path} hook-user-prompt",
+                    "statusMessage": "leak-guard: scanning prompt...",
+                }
+            ]
+        },
+        dedup_key="hook-user-prompt",
+    )
+
+    # ── PreToolUse ────────────────────────────────────────────────────────
+    _add_hook(
+        "PreToolUse",
+        {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": f"{python} {scanner_path} hook-pre-tool",
+                }
+            ]
+        },
+        dedup_key="hook-pre-tool",
+    )
+
+    # ── PostToolUse ───────────────────────────────────────────────────────
+    _add_hook(
+        "PostToolUse",
+        {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": f"{python} {scanner_path} hook-post-tool",
+                }
+            ]
+        },
+        dedup_key="hook-post-tool",
+    )
+
+    # ── SessionStart (matcher=startup) ────────────────────────────────────
+    _add_hook(
+        "SessionStart",
+        {
+            "matcher": "startup",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": f"{python} {scanner_path} hook-session-start",
+                }
+            ],
+        },
+        dedup_key="hook-session-start",
+    )
+
+    # ── Write back ────────────────────────────────────────────────────────
+    try:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic write via temp file
+        tmp = settings_path.with_suffix(".json.tmp")
+        tmp.write_text(_json.dumps(data, indent=2), encoding="utf-8")
+        tmp.replace(settings_path)
+    except Exception as exc:
+        print(f"leak-guard: could not write {settings_path}: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"leak-guard: hooks wired in {settings_path}")
+    print("  Restart Claude Code for changes to take effect.")
+    return 0
+
+
 _SHA_RE = re.compile(r'^[0-9a-f]{40}$')
 
 

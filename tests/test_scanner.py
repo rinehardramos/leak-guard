@@ -896,3 +896,106 @@ class TestTrainingMode:
         assert r.returncode == 0, r.stderr
         allowlist = (rules_dir / "allowlist.toml").read_text()
         assert "high-entropy-base64" in allowlist
+
+
+class TestHookSettings:
+    """Tests for the hook-settings subcommand that wires Claude Code hooks."""
+
+    HOOK_CMDS = [
+        "hook-user-prompt",
+        "hook-pre-tool",
+        "hook-post-tool",
+        "hook-session-start",
+    ]
+
+    def _run_hook_settings(self, settings_path: Path, scanner_path: str = "/fake/scanner.py") -> int:
+        """Call cmd_hook_settings with a custom settings path and scanner path."""
+        return sc.cmd_hook_settings(
+            settings_path=settings_path,
+            scanner_path=scanner_path,
+        )
+
+    def test_creates_settings_file_if_missing(self, tmp_path):
+        settings = tmp_path / "settings.json"
+        assert not settings.exists()
+        rc = self._run_hook_settings(settings)
+        assert rc == 0
+        assert settings.exists()
+        data = json.loads(settings.read_text())
+        assert "hooks" in data
+
+    def test_wires_all_four_hook_events(self, tmp_path):
+        settings = tmp_path / "settings.json"
+        rc = self._run_hook_settings(settings)
+        assert rc == 0
+        data = json.loads(settings.read_text())
+        hooks = data["hooks"]
+        assert "UserPromptSubmit" in hooks
+        assert "PreToolUse" in hooks
+        assert "PostToolUse" in hooks
+        assert "SessionStart" in hooks
+
+    def test_idempotent_no_duplicates_on_rerun(self, tmp_path):
+        settings = tmp_path / "settings.json"
+        # Run twice
+        self._run_hook_settings(settings)
+        self._run_hook_settings(settings)
+        data = json.loads(settings.read_text())
+        # Each event should still have exactly one leak-guard hook entry
+        for event in ["UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionStart"]:
+            entries = data["hooks"][event]
+            lg_entries = [
+                e for e in entries
+                if any(
+                    "scanner.py" in h.get("command", "")
+                    for h in e.get("hooks", [])
+                )
+            ]
+            assert len(lg_entries) == 1, f"{event} has {len(lg_entries)} leak-guard entries after idempotent rerun"
+
+    def test_preserves_existing_non_leakguard_hooks(self, tmp_path):
+        settings = tmp_path / "settings.json"
+        # Pre-populate with an existing unrelated hook
+        existing = {
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "matcher": "compact",
+                        "hooks": [
+                            {"type": "command", "command": "echo 'compacted'"}
+                        ]
+                    }
+                ]
+            }
+        }
+        settings.write_text(json.dumps(existing))
+        rc = self._run_hook_settings(settings)
+        assert rc == 0
+        data = json.loads(settings.read_text())
+        session_entries = data["hooks"]["SessionStart"]
+        # compact hook still present
+        compact = [e for e in session_entries if e.get("matcher") == "compact"]
+        assert len(compact) == 1
+        # leak-guard startup hook also added
+        startup = [e for e in session_entries if e.get("matcher") == "startup"]
+        assert len(startup) == 1
+
+    def test_each_hook_contains_correct_subcommand(self, tmp_path):
+        settings = tmp_path / "settings.json"
+        scanner = "/some/path/scanner.py"
+        self._run_hook_settings(settings, scanner_path=scanner)
+        data = json.loads(settings.read_text())
+        for event, subcmd in [
+            ("UserPromptSubmit", "hook-user-prompt"),
+            ("PreToolUse", "hook-pre-tool"),
+            ("PostToolUse", "hook-post-tool"),
+            ("SessionStart", "hook-session-start"),
+        ]:
+            entries = data["hooks"][event]
+            commands = [
+                h["command"]
+                for e in entries
+                for h in e.get("hooks", [])
+            ]
+            assert any(subcmd in cmd for cmd in commands), \
+                f"{event}: expected subcommand '{subcmd}' in commands {commands}"
