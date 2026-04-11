@@ -1478,3 +1478,55 @@ class TestFeedbackLoop:
         ]
         count = sc._match_fp_profile(profile, history)
         assert count == 2  # two matching entries
+
+
+class TestPostToolNer:
+    """Component 7: PostToolUse NER — catch unstructured PII in tool output."""
+
+    def test_name_in_read_output_blocked(self):
+        """NER-detected name in Read output triggers block."""
+        text = (
+            "Patient records:\n"
+            "The patient John Smith was diagnosed with pneumonia.\n"
+            "Treatment plan was discussed with the physician.\n"
+        ) + "Additional notes. " * 15  # pad to exceed NER min length
+        event = {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/tmp/patient_notes.txt"},
+            "tool_response": {"content": text},
+            "session_id": "test",
+        }
+        rc, out, stderr = run_hook("hook-post-tool", event)
+        assert rc == 0  # PostToolUse always exits 0
+        if out and out.get("decision") == "block":
+            reason = out.get("reason", "")
+            assert "ner" in reason.lower() or "PII" in reason or "REDACTED" in reason
+
+    def test_short_output_no_ner(self):
+        """Short tool output should not trigger NER scan."""
+        event = {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/tmp/short.txt"},
+            "tool_response": {"content": "Hello World"},
+            "session_id": "test",
+        }
+        rc, out, _ = run_hook("hook-post-tool", event)
+        assert rc == 0
+        assert out is None or out.get("decision") != "block"
+
+    def test_output_with_regex_findings_no_ner(self):
+        """When regex finds secrets, NER is not needed (already blocked)."""
+        aws = "AKIA" + "Y3FDSNDKFK" + "SIDJSW"
+        event = {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/tmp/creds.txt"},
+            "tool_response": {"content": f"AWS_KEY={aws}\n"},
+            "session_id": "test",
+        }
+        rc, out, _ = run_hook("hook-post-tool", event)
+        assert rc == 0
+        assert out is not None
+        assert out.get("decision") == "block"

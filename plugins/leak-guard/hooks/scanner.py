@@ -2035,6 +2035,20 @@ def hook_post_tool() -> int:
             return 0
     findings = scan_all(text=text, source_label=source)
     if not findings:
+        # NER fallback — catch unstructured PII in tool output
+        if len(text) >= _NER_MIN_TEXT_LENGTH:
+            ner_findings = _scan_ner_candidates(text, source=source)
+            if ner_findings:
+                ner_summary = "\n".join(
+                    f"  {f.rule_id} ({f.severity}) \u2014 {f.preview}"
+                    for f in ner_findings
+                )
+                emit_post_tool_block(
+                    f"leak-guard: unstructured PII detected in {tool} output. "
+                    f"Content redacted.\n{ner_summary}",
+                    silent=silent,
+                )
+                return 0
         return 0
     secrets, pii = classify(findings)
     if secrets:
