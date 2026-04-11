@@ -86,24 +86,34 @@ gitleaks is optional — leak-guard warns if it is absent but does not fail. If 
 
 ---
 
-## Quick install
+## Installation
 
-**Optional but recommended — install gitleaks for deeper detection:**
+**Prerequisites:** Python 3.9+ (system Python is fine). [gitleaks](https://github.com/gitleaks/gitleaks) is optional but recommended for vendor-specific secret patterns (`brew install gitleaks`).
+
+### 1. Install the plugin
+
 ```bash
-brew install gitleaks   # macOS
-# Linux: https://github.com/gitleaks/gitleaks#installing
+claude plugin install leak-guard@leak-guard
 ```
 
-**Install the plugin:**
-```
-/plugin marketplace add rinehardramos/leak-guard
-/plugin install leak-guard@leak-guard
+### 2. Wire the hooks (one-time setup)
+
+```bash
+python3 ~/.claude/plugins/cache/leak-guard/leak-guard/0.3.0/hooks/scanner.py install
 ```
 
-Restart Claude Code. On the next session you will see:
-```
-leak-guard v0.3.0 active: hooks armed for secrets + PII.
-```
+This single command:
+- Syncs the plugin source into the Claude Code cache
+- Runs the selftest suite to verify your environment
+- Writes all four Claude Code hooks (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `SessionStart`) into `~/.claude/settings.json` — idempotently, no duplicates
+
+### 3. Restart Claude Code
+
+Hook changes take effect on the next session start.
+
+---
+
+**Already installed? Re-run step 2** to pick up rule and hook updates after a plugin version upgrade.
 
 ---
 
