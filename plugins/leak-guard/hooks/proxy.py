@@ -11,6 +11,7 @@ import http.client
 import http.server
 import json
 import os
+import signal
 import ssl
 import sys
 import threading
@@ -467,3 +468,103 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         # Suppress default BaseHTTPRequestHandler logging
         pass
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# PID management
+# ──────────────────────────────────────────────────────────────────────────
+
+def _write_pid(pid: int) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    PID_FILE.write_text(str(pid))
+
+
+def _read_pid():
+    try:
+        return int(PID_FILE.read_text().strip())
+    except Exception:
+        return None
+
+
+def _cleanup_pid() -> None:
+    try:
+        PID_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def is_proxy_running() -> bool:
+    pid = _read_pid()
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)  # signal 0 = check existence
+        return True
+    except ProcessLookupError:
+        _cleanup_pid()
+        return False
+    except PermissionError:
+        return True  # exists but can't signal
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Inactivity watchdog
+# ──────────────────────────────────────────────────────────────────────────
+
+def _inactivity_watchdog(server) -> None:
+    while True:
+        time.sleep(60)
+        if time.time() - _last_activity > _INACTIVITY_TIMEOUT:
+            print("[proxy] shutting down after inactivity", file=sys.stderr, flush=True)
+            _cleanup_pid()
+            server.shutdown()
+            break
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Entry point
+# ──────────────────────────────────────────────────────────────────────────
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(prog="leak-guard-proxy")
+    parser.add_argument("--daemon", action="store_true")
+    parser.add_argument("--port", type=int, default=LISTEN_PORT)
+    args = parser.parse_args()
+    port = args.port
+
+    if args.daemon:
+        pid = os.fork()
+        if pid > 0:
+            _write_pid(pid)
+            print(f"[proxy] started in background (PID {pid})", flush=True)
+            sys.exit(0)
+        os.setsid()
+        devnull = os.open(os.devnull, os.O_RDWR)
+        os.dup2(devnull, 0)
+        os.dup2(devnull, 1)
+        log_file = STATE_DIR / "proxy.log"
+        log_fd = os.open(str(log_file), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.dup2(log_fd, 2)
+
+    server = ThreadedHTTPServer(("127.0.0.1", port), ProxyHandler)
+    _write_pid(os.getpid())
+    print(f"[proxy] listening on http://127.0.0.1:{port}", file=sys.stderr, flush=True)
+
+    wd = threading.Thread(target=_inactivity_watchdog, args=(server,), daemon=True)
+    wd.start()
+
+    def _shutdown(signum, frame):
+        _cleanup_pid()
+        server.shutdown()
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        _cleanup_pid()
+        server.shutdown()
+
+
+if __name__ == "__main__":
+    main()

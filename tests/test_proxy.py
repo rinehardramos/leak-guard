@@ -491,3 +491,36 @@ class TestThreadedHTTPServer:
 
         assert len(results) == 5
         assert all(r == 200 for r in results), f"Unexpected results: {results}"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# TestProxyLifecycle
+# ──────────────────────────────────────────────────────────────────────────
+
+class TestProxyLifecycle:
+    def test_write_pid_file(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(px, "PID_FILE", tmp_path / "proxy.pid")
+        monkeypatch.setattr(px, "STATE_DIR", tmp_path)
+        px._write_pid(12345)
+        assert (tmp_path / "proxy.pid").exists()
+        assert (tmp_path / "proxy.pid").read_text().strip() == "12345"
+
+    def test_read_pid(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(px, "PID_FILE", tmp_path / "proxy.pid")
+        (tmp_path / "proxy.pid").write_text("12345")
+        assert px._read_pid() == 12345
+
+    def test_read_pid_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(px, "PID_FILE", tmp_path / "proxy.pid")
+        assert px._read_pid() is None
+
+    def test_is_proxy_running_false_when_no_pid(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(px, "PID_FILE", tmp_path / "proxy.pid")
+        assert px.is_proxy_running() is False
+
+    def test_cleanup_pid(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(px, "PID_FILE", tmp_path / "proxy.pid")
+        monkeypatch.setattr(px, "STATE_DIR", tmp_path)
+        px._write_pid(99999)
+        px._cleanup_pid()
+        assert not (tmp_path / "proxy.pid").exists()
