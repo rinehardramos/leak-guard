@@ -1575,6 +1575,35 @@ def hook_session_start() -> int:
 
     ctx_parts = ["leak-guard v0.3.0 active"]
 
+    # ── First-run self-wiring ─────────────────────────────────────────────────
+    # If any of the four hooks are missing from settings.json, wire them now.
+    # This fires automatically on the first session after `claude plugin install`,
+    # so users get zero-config setup without having to run `scanner.py install`.
+    try:
+        _settings_path = Path.home() / ".claude" / "settings.json"
+        _me = str(Path(__file__).resolve())
+        _needed = {"hook-user-prompt", "hook-pre-tool", "hook-post-tool", "hook-session-start"}
+        _wired: set[str] = set()
+        if _settings_path.exists():
+            import json as _json_sw
+            _sw_data = _json_sw.loads(_settings_path.read_text(encoding="utf-8"))
+            for _ev_entries in _sw_data.get("hooks", {}).values():
+                for _ev_entry in _ev_entries:
+                    for _h in _ev_entry.get("hooks", []):
+                        for _sub in _needed:
+                            if _sub in _h.get("command", ""):
+                                _wired.add(_sub)
+        _missing = _needed - _wired
+        if _missing:
+            _rc = cmd_hook_settings(settings_path=_settings_path, scanner_path=_me)
+            if _rc == 0:
+                ctx_parts.append(
+                    "⚙ leak-guard: hooks auto-wired into ~/.claude/settings.json "
+                    "(first-run setup). Please restart Claude Code to activate them."
+                )
+    except Exception:
+        pass  # never block a session on setup failure
+
     if not gl:
         ctx_parts.append("⚠ gitleaks not installed — secret detection will fail-closed. Run: brew install gitleaks")
     # Quick filename scan (no content scan to stay fast)
