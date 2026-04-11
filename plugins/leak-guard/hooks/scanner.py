@@ -1269,328 +1269,6 @@ def emit_prompt_block(reason: str, *, silent: bool = False) -> None:
         print(f"\n[leak-guard] {reason}", file=sys.stderr)
 
 
-def emit_allow_modified(updated_prompt: str) -> None:
-    """Re-inject the original (or redacted) prompt as additionalContext.
-
-    UserPromptSubmit does not support updatedUserPrompt — only additionalContext.
-    We inject the prompt text so Claude sees it and responds to it.
-    """
-    out = {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": updated_prompt}}
-    sys.stdout.write(json.dumps(out))
-    sys.stdout.flush()
-
-
-def _open_tty():
-    """Open /dev/tty for interactive I/O. Returns file or None if non-interactive."""
-    try:
-        return open("/dev/tty", "r+", buffering=1)
-    except OSError:
-        return None
-
-
-def _action_picker(findings: list, prompt: str, silent: bool) -> tuple:
-    """
-    Show interactive action menu when findings are detected.
-    Returns (exit_code, updated_prompt_or_none).
-    - (0, None)    -> allow as-is
-    - (0, text)    -> allow with modified prompt (redacted)
-    - (2, None)    -> block/discard
-    """
-    if silent:
-        return (2, None)
-
-    tty = _open_tty()
-    if tty is None:
-        return (2, None)
-
-    try:
-        # Build display
-        lines = ["\n\U0001f6a8 leak-guard: credential detected in your prompt.\n"]
-        for f in findings:
-            lines.append(f"  Rule: {f.rule_id} ({f.severity})")
-            lines.append(f"  Preview: {f.preview}\n")
-        lines.append("  What would you like to do?")
-        lines.append("  [A] Allow once — send prompt as-is")
-        lines.append("  [R] Redact — strip flagged token(s), then send")
-        lines.append("  [D] Delete — discard prompt entirely   (default)")
-        lines.append("  [F] Flag as false positive — allowlist + send")
-        lines.append("  > ")
-        tty.write("\n".join(lines))
-        tty.flush()
-
-        try:
-            ch = tty.read(1)
-            # consume rest of line
-            if ch != "\n":
-                tty.readline()
-        except KeyboardInterrupt:
-            return (2, None)
-
-        choice = ch.strip().lower() if ch else ""
-
-        if choice == "a":
-            return (0, None)
-        elif choice == "r":
-            redacted = prompt
-            for f in findings:
-                if f.raw_match:
-                    redacted = redacted.replace(f.raw_match, "[REDACTED]")
-            return (0, redacted)
-        elif choice == "f":
-            for f in findings:
-                if f.raw_match:
-                    try:
-                        subprocess.run(
-                            [sys.argv[0], "flag", "fp",
-                             "--literal", f.raw_match,
-                             "--reason", "user marked FP in action picker"],
-                            timeout=10,
-                        )
-                    except Exception:
-                        pass
-            return (0, None)
-        else:
-            # "d", Enter, or anything else → block
-            return (2, None)
-    finally:
-        try:
-            tty.close()
-        except Exception:
-            pass
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# Prompt-injected action picker (Turn 1: block + write pending; Turn 2: handle choice)
-# ──────────────────────────────────────────────────────────────────────────
-
-# Pending action file — stores the original prompt + redact targets temporarily
-# so the user can reply with A/R/D/F in the next turn.
-# Security note: raw_match values are stored here temporarily (mode 0o600),
-# same security posture as ssh-agent temp files. Auto-deleted after use or TTL.
-PENDING_ACTION = STATE_DIR / "pending_action.json"
-
-_PENDING_TTL = 300  # 5 minutes
-
-
-def _write_pending_action(prompt: str, findings: list[Finding]) -> None:
-    """Write pending_action.json with mode 0o600.
-
-    Stores enriched finding data for Turn 2 redact/allow handling.
-    """
-    try:
-        ensure_state_dir()
-        data = {
-            "prompt": prompt,
-            "findings": [
-                {
-                    "rule_id": f.rule_id,
-                    "category": f.category,
-                    "severity": f.severity,
-                    "description": f.description,
-                    "raw_match": f.raw_match,
-                    "confidence": _confidence(f),
-                    "redaction_tag": _redaction_tag(f),
-                }
-                for f in findings
-            ],
-            "expires_at": time.time() + _PENDING_TTL,
-        }
-        fd = os.open(str(PENDING_ACTION), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(data, fh)
-    except Exception:
-        pass
-
-
-def _read_pending_action() -> dict | None:
-    """Read and return pending action, or None if missing/expired."""
-    try:
-        if not PENDING_ACTION.exists():
-            return None
-        data = json.loads(PENDING_ACTION.read_text(encoding="utf-8"))
-        if time.time() > data.get("expires_at", 0):
-            try:
-                PENDING_ACTION.unlink(missing_ok=True)
-            except Exception:
-                pass
-            return None
-        return data
-    except Exception:
-        return None
-
-
-def _is_choice_reply(prompt: str) -> str | None:
-    """Return 'redact' or 'allow' if prompt is a reply to the block-and-preview.
-
-    Returns None if no pending_action.json exists or response is a new prompt.
-    """
-    try:
-        if not PENDING_ACTION.exists():
-            return None
-    except Exception:
-        return None
-    stripped = prompt.strip().lower()
-    # Explicit allow
-    if stripped in ("a", "allow"):
-        return "allow"
-    # Enter (empty), or any short redact-like response
-    if not stripped or stripped in ("r", "redact", ".", "y", "yes"):
-        return "redact"
-    # Long responses (>20 chars) are likely new prompts, not choices.
-    if len(stripped) > 20:
-        PENDING_ACTION.unlink(missing_ok=True)
-        return None
-    # Short non-keyword response with active pending → safe default
-    return "redact"
-
-
-def _handle_choice(choice: str, pending: dict) -> int:
-    """Execute the user's choice from the block-and-preview.
-
-    'redact': Replace raw values with semantic tags, send via additionalContext.
-    'allow': Add values to allowlist, send original via additionalContext.
-    """
-    try:
-        PENDING_ACTION.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-    original_prompt = pending.get("prompt", "")
-    findings = pending.get("findings", [])
-
-    if choice == "allow":
-        for f in findings:
-            raw = f.get("raw_match", "")
-            if raw:
-                _append_literal(raw, "user allowed via block-and-preview")
-                _log_fp_decision(f, original_prompt)
-        emit_allow_modified(original_prompt)
-        return 0
-
-    # "redact" (default)
-    redacted = original_prompt
-    for f in findings:
-        raw = f.get("raw_match", "")
-        tag = f.get("redaction_tag", "[REDACTED]")
-        if raw:
-            redacted = redacted.replace(raw, tag)
-
-    instruction = _build_redact_instruction(redacted, findings)
-
-    # Add symbolic fingerprints for borderline findings
-    borderline = [f for f in findings if f.get("rule_id") in _BORDERLINE_RULES]
-
-    # Load FP history for profile matching
-    fp_history: list[dict] = []
-    if FP_PROFILE.exists():
-        try:
-            fp_history = [json.loads(l) for l in
-                          FP_PROFILE.read_text(encoding="utf-8").splitlines()
-                          if l.strip()]
-        except Exception:
-            pass
-
-    if borderline:
-        fp_lines = ["\n\nleak-guard: Borderline values were redacted. Symbolic profiles:"]
-        for f in borderline:
-            raw = f.get("raw_match", "")
-            if raw:
-                dummy_finding = Finding(f["rule_id"], f.get("category", ""), "",
-                                        0, "", raw_match=raw)
-                fp = _build_symbolic_fingerprint(dummy_finding, original_prompt)
-                profile = {"rule_id": fp["rule_id"], "charset": fp["charset"],
-                           "position": fp["position"], "length": fp["length"]}
-                match_count = _match_fp_profile(profile, fp_history)
-                fp_lines.append(
-                    f"  Rule: {fp['rule_id']}\n"
-                    f"  Length: {fp['length']} chars, entropy: {fp['entropy']} bits/char, "
-                    f"charset: {fp['charset']}\n"
-                    f"  Position: {fp['position']}\n"
-                    f"  Context keywords: {', '.join(fp['context_keywords']) or 'none'}\n"
-                    f"  Adjacent code: {fp['adjacent_code']}"
-                )
-                if match_count > 0:
-                    fp_lines.append(
-                        f"  Previously allowed: {match_count} time(s) — likely false positive."
-                    )
-        fp_lines.append(
-            "\nIf these profiles suggest computed/derived values rather than "
-            "credentials, inform the user they were likely false positives and "
-            "they can re-send with 'a' to allowlist them."
-        )
-        instruction += "\n".join(fp_lines)
-
-    emit_allow_modified(instruction)
-    return 0
-
-
-def _build_menu_text(findings: list) -> str:
-    """Build the action picker menu text shown to the user via Claude's chat UI."""
-    lines = ["\U0001f6a8 leak-guard intercepted your prompt — suspicious content detected.\n"]
-    for f in findings:
-        lines.append(f"  \u00b7 {f.rule_id} ({f.severity}) \u2014 {f.preview}")
-    lines.append("\n  Your original message was withheld. Reply with your choice:")
-    lines.append("    A \u2014 Allow once (send original prompt as-is)")
-    lines.append("    R \u2014 Redact (strip flagged content, send cleaned prompt)")
-    lines.append("    D \u2014 Discard (cancel, default after 5 min)")
-    lines.append("    F \u2014 Flag as false positive (allowlist + send)")
-    lines.append("\n  Choice [A/R/D/F]:")
-    return "\n".join(lines)
-
-
-def emit_menu_prompt(menu_text: str) -> None:
-    """Inject the action picker menu as additionalContext so Claude sees and responds to it.
-
-    UserPromptSubmit hookSpecificOutput only supports `additionalContext` (not
-    `updatedUserPrompt` which is PreToolUse-only).  Exit 0 + additionalContext
-    injects the text as a meta message Claude reads — Claude then asks the user
-    for A/R/D/F.  The original secret-bearing prompt is withheld by exit 2 on
-    the block branches; this is called only from the Turn 2 allow path.
-    """
-    out = {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": menu_text}}
-    sys.stdout.write(json.dumps(out))
-    sys.stdout.flush()
-
-
-def _render_preview(prompt: str, findings: list[Finding]) -> None:
-    """Render highlighted preview to stderr. Local only — never sent to Anthropic."""
-    highlighted = prompt
-    for f in findings:
-        if f.raw_match:
-            highlighted = highlighted.replace(f.raw_match, f">>>{f.raw_match}<<<")
-    lines = [
-        "\n\u26a0 leak-guard: sensitive content detected \u2014 prompt blocked before sending.\n",
-        "Your message:",
-        "\u2500" * 47,
-        highlighted,
-        "\u2500" * 47,
-        "\nFindings:",
-    ]
-    for i, f in enumerate(findings, 1):
-        conf = _confidence(f)
-        lines.append(f"  {i}. [{f.severity} {conf:.2f}] {f.rule_id} \u2014 {f.description}")
-    lines.extend([
-        "\nReply:",
-        "  \u21b5 Enter  \u2014 redact and send (any reply except 'a')",
-        "  a        \u2014 always allow these values",
-    ])
-    print("\n".join(lines), file=sys.stderr, flush=True)
-
-
-def _build_redact_instruction(redacted_prompt: str, findings: list[dict]) -> str:
-    """Build the additionalContext instruction for the redact flow (Turn 2)."""
-    tags_used = sorted(set(f.get("redaction_tag", "[REDACTED]") for f in findings))
-    tag_list = "\n".join(f"  {tag}" for tag in tags_used)
-    return (
-        "SYSTEM NOTE (leak-guard): The user's message contained sensitive content "
-        "that was redacted before reaching you.\n\n"
-        f"Redaction tags used:\n{tag_list}\n\n"
-        f"Redacted message:\n{redacted_prompt}\n\n"
-        "Respond to the user's request using the redacted message. Where the "
-        "redacted values are needed for the task, advise the user to provide "
-        "anonymized or synthetic values instead. Do not attempt to guess or "
-        "reconstruct the redacted values."
-    )
 
 
 def _build_symbolic_fingerprint(finding: Finding, text: str) -> dict:
@@ -1896,52 +1574,23 @@ def _ask_message(findings: list[Finding]) -> str:
 
 
 def hook_user_prompt() -> int:
+    """UserPromptSubmit hook — pass-through.
+
+    Wire privacy is handled by the proxy (ANTHROPIC_BASE_URL).
+    This hook remains as a no-op to avoid hook registration errors.
+    """
     event = read_event()
     prompt = event.get("prompt", "") or ""
-    session_id = event.get("session_id", "")
 
-    # ── Turn 2: check if this is a reply to the block-and-preview ────────
-    choice = _is_choice_reply(prompt)
-    if choice is not None:
-        pending = _read_pending_action()
-        if pending is not None:
-            return _handle_choice(choice, pending)
-
-    allow_once = prompt.lstrip().startswith(_ALLOW_ONCE_PREFIX)
-
-    findings = scan_all(text=prompt, source_label="<user-prompt>")
-
-    # NER candidate extraction — augments regex findings
-    ner_findings = _scan_ner_candidates(prompt, source="<user-prompt>")
-    findings.extend(ner_findings)
-
-    if not findings:
-        # Clean prompt path — inject NER instruction for long text
-        if len(prompt) >= _NER_MIN_TEXT_LENGTH:
-            out = {"hookSpecificOutput": {
-                "hookEventName": "UserPromptSubmit",
-                "additionalContext": _NER_INSTRUCTION,
-            }}
-            sys.stdout.write(json.dumps(out))
-            sys.stdout.flush()
-        return 0
-
-    # [allow-once] prefix bypasses all findings.
-    if allow_once:
-        audit("allow_once_bypass", {})
-        return 0
-
-    # ── Block-and-preview: exit 2, render preview, save pending ──────────
-    audit("block_user_prompt", {"count": len(findings)})
-    _write_training_entry(findings, session_id=session_id)
-    _write_pending_action(prompt, findings)
-    _render_preview(prompt, findings)
-
-    reason = "leak-guard: sensitive content detected \u2014 prompt blocked. Reply to redact or allow."
-    out = {"decision": "block", "reason": reason}
-    sys.stdout.write(json.dumps(out))
-    sys.stdout.flush()
-    return 2
+    # NER instruction for long text (informational only — no blocking)
+    if len(prompt) >= _NER_MIN_TEXT_LENGTH:
+        out = {"hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": _NER_INSTRUCTION,
+        }}
+        sys.stdout.write(json.dumps(out))
+        sys.stdout.flush()
+    return 0
 
 
 def hook_pre_tool() -> int:
@@ -2653,19 +2302,17 @@ def cmd_selftest() -> int:
     except Exception as _exc:
         check("hook JSON round-trip (clean prompt)", False, str(_exc))
 
-    # Hook blocks a known fake credential (exit 2 = block-and-preview)
+    # Hook passes credential through (proxy handles wire privacy)
     # String is built at runtime to avoid triggering the scanner on source literals.
     _fake_cred_prompt = "my key " + "CSKC:" + "ScdsJCCKLSLKDKLCNLKCEINK2233as"
     _fake_cred_event = {"hook_event_name": "UserPromptSubmit", "prompt": _fake_cred_prompt, "session_id": "selftest"}
     try:
         _r2 = _sp.run([_sys.executable, __file__, "hook-user-prompt"],
             input=_json.dumps(_fake_cred_event), capture_output=True, text=True, timeout=10)
-        _out = _json.loads(_r2.stdout) if _r2.stdout.strip() else {}
-        _decision = _out.get("decision", "")
-        check("hook blocks credential", _r2.returncode == 2 and _decision == "block",
-              f"rc={_r2.returncode} decision={_decision}")
+        check("hook passes credential (proxy redacts)", _r2.returncode == 0,
+              f"rc={_r2.returncode}")
     except Exception as _exc:
-        check("hook blocks credential", False, str(_exc))
+        check("hook passes credential (proxy redacts)", False, str(_exc))
 
     # 1. Rule loading
     pii_rules = load_pii_rules()
@@ -3384,6 +3031,70 @@ def cmd_verify_ingest(args) -> int:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Proxy management commands
+# ──────────────────────────────────────────────────────────────────────────
+
+def cmd_proxy_start() -> int:
+    """Start the proxy in daemon mode."""
+    proxy_script = Path(__file__).resolve().parent / "proxy.py"
+    if not proxy_script.exists():
+        print("leak-guard: proxy.py not found", file=sys.stderr)
+        return 2
+    result = subprocess.run(
+        [sys.executable, str(proxy_script), "--daemon"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode == 0:
+        print(result.stdout.strip() if result.stdout.strip() else "proxy started")
+    else:
+        print(f"proxy start failed: {result.stderr}", file=sys.stderr)
+    return result.returncode
+
+
+def cmd_proxy_stop() -> int:
+    """Stop the proxy by sending SIGTERM to the PID."""
+    import signal as _sig
+    pid_file = STATE_DIR / "proxy.pid"
+    if not pid_file.exists():
+        print("leak-guard: proxy not running (no PID file)")
+        return 0
+    try:
+        pid = int(pid_file.read_text().strip())
+        os.kill(pid, _sig.SIGTERM)
+        pid_file.unlink(missing_ok=True)
+        print(f"leak-guard: proxy stopped (PID {pid})")
+        return 0
+    except ProcessLookupError:
+        pid_file.unlink(missing_ok=True)
+        print("leak-guard: proxy was not running (stale PID file cleaned)")
+        return 0
+    except Exception as e:
+        print(f"leak-guard: could not stop proxy: {e}", file=sys.stderr)
+        return 2
+
+
+def cmd_proxy_status() -> int:
+    """Report proxy status."""
+    import urllib.request
+    port = int(os.environ.get("LEAK_GUARD_PROXY_PORT", "18019"))
+    try:
+        resp = urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/lg-status", timeout=2)
+        data = json.loads(resp.read())
+        print(f"leak-guard proxy: running on port {port}")
+        print(f"  allowlist size: {data.get('allowlist_size', '?')}")
+        print(f"  requests redacted: {data.get('requests_redacted', '?')}")
+        return 0
+    except Exception:
+        pid_file = STATE_DIR / "proxy.pid"
+        if pid_file.exists():
+            print(f"leak-guard proxy: PID file exists but proxy not responding on port {port}")
+        else:
+            print("leak-guard proxy: not running")
+        return 1
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # main
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -3402,6 +3113,9 @@ def main(argv: list[str]) -> int:
     sub.add_parser("hook-settings", help="Wire Claude Code hooks into ~/.claude/settings.json")
     sub.add_parser("git-hook-pre-push")
     sub.add_parser("selftest")
+    sub.add_parser("proxy-start", help="Start the leak-guard proxy in background")
+    sub.add_parser("proxy-stop", help="Stop the leak-guard proxy")
+    sub.add_parser("proxy-status", help="Show proxy status")
 
     # `train` — author-only training pipeline
     tp = sub.add_parser("train", help="[author] Training pipeline: verdict/list/analyze/promote")
@@ -3498,6 +3212,12 @@ def main(argv: list[str]) -> int:
             return cmd_verify_emit(args)
         if args.cmd == "verify-ingest":
             return cmd_verify_ingest(args)
+        if args.cmd == "proxy-start":
+            return cmd_proxy_start()
+        if args.cmd == "proxy-stop":
+            return cmd_proxy_stop()
+        if args.cmd == "proxy-status":
+            return cmd_proxy_status()
     except Exception as e:
         audit("scanner_exception", {"cmd": args.cmd, "error": str(e), "tb": traceback.format_exc()[:2000]})
         # Fail-closed for hook events; pass-through for CLI

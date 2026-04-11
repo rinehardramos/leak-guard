@@ -235,31 +235,25 @@ class TestHookUserPrompt:
     def _event(self, prompt: str) -> dict:
         return {"hook_event_name": "UserPromptSubmit", "prompt": prompt, "session_id": "test"}
 
-    def test_clean_prompt_no_output(self):
+    def test_clean_prompt_passes_through(self):
         rc, out, _ = run_hook("hook-user-prompt", self._event("what is the weather like?"))
         assert rc == 0
-        # Clean path emits nothing — out is None or empty dict
-        if out:
-            assert out.get("decision") != "block"
 
-    def test_secret_in_prompt_blocked(self):
-        """Secret prompt: hook exits 2 (blocked before sending)."""
+    def test_secret_in_prompt_passes_through(self):
+        """Secrets pass through hook — proxy handles redaction now."""
         rc, out, stderr = run_hook(
             "hook-user-prompt",
             self._event(f"My AWS key is {_AWS}, help me use it"),
         )
-        assert rc == 2
-        assert "leak-guard" in stderr
-        assert ">>>" in stderr  # highlighted preview
+        assert rc == 0  # no longer blocks
 
-    def test_pii_in_prompt_blocked(self):
-        """PII prompt: hook exits 2 (blocked before sending)."""
+    def test_pii_in_prompt_passes_through(self):
+        """PII passes through hook — proxy handles redaction now."""
         rc, out, stderr = run_hook(
             "hook-user-prompt",
             self._event("My SSN is 123-45-6789, is it safe?"),
         )
-        assert rc == 2
-        assert "leak-guard" in stderr
+        assert rc == 0  # no longer blocks
 
 
 class TestHookPreTool:
@@ -488,8 +482,8 @@ class TestFuzzyCredentials:
         for h in hits:
             assert self._CRED not in h.preview
 
-    def test_hook_blocks_original_prompt(self):
-        """Hook blocks prompt (exit 2) when fuzzy credential detected."""
+    def test_hook_passes_through_fuzzy_credential(self):
+        """Hook passes through (exit 0) — proxy handles wire privacy now."""
         rc, out, stderr = run_hook(
             "hook-user-prompt",
             {
@@ -498,9 +492,7 @@ class TestFuzzyCredentials:
                 "session_id": "test",
             },
         )
-        assert rc == 2
-        assert "leak-guard" in stderr
-        assert self._CRED not in json.dumps(out or {})
+        assert rc == 0  # no longer blocks
 
 
 class TestDummyValues:
@@ -625,122 +617,6 @@ class TestSelftest:
         assert "OK" in result.stdout
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Prompt-injected action picker tests
-# ─────────────────────────────────────────────────────────────────────────────
-
-@pytest.fixture(autouse=False)
-def isolated_state_dir(monkeypatch, tmp_path):
-    """Redirect STATE_DIR and all derived paths to a temp directory."""
-    state = tmp_path / "leak-guard-state"
-    state.mkdir(mode=0o700)
-    monkeypatch.setenv("LEAK_GUARD_STATE_DIR", str(state))
-    # Patch module-level constants so the in-process scanner uses the temp dir
-    monkeypatch.setattr(sc, "STATE_DIR", state)
-    monkeypatch.setattr(sc, "AUDIT_LOG", state / "audit.log")
-    monkeypatch.setattr(sc, "USER_ALLOWLIST", state / "allowlist.toml")
-    monkeypatch.setattr(sc, "PENDING_ACTION", state / "pending_action.json")
-    return state
-
-
-def _make_pending(state_dir: Path, prompt: str, redact_targets: list,
-                  expires_delta: float = 300, findings: list | None = None) -> None:
-    """Write a synthetic pending_action.json into state_dir."""
-    if findings is None:
-        findings = [{"rule_id": "test-rule", "category": "pii",
-                     "severity": "high", "description": "test",
-                     "raw_match": t, "confidence": 0.90,
-                     "redaction_tag": "[REDACTED:test]"} for t in redact_targets]
-    data = {
-        "prompt": prompt,
-        "findings": findings,
-        "expires_at": time.time() + expires_delta,
-    }
-    p = state_dir / "pending_action.json"
-    fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        json.dump(data, fh)
-
-
-def _run_hook_with_state(state_dir: Path, prompt: str) -> tuple[int, dict | None, str]:
-    """Run hook-user-prompt with LEAK_GUARD_STATE_DIR pointing to state_dir."""
-    event = {"hook_event_name": "UserPromptSubmit", "prompt": prompt, "session_id": "test"}
-    result = subprocess.run(
-        [sys.executable, str(SCANNER), "hook-user-prompt"],
-        input=json.dumps(event),
-        capture_output=True,
-        text=True,
-        timeout=30,
-        env={**os.environ, "LEAK_GUARD_STATE_DIR": str(state_dir)},
-    )
-    out = None
-    if result.stdout.strip():
-        try:
-            out = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            pass
-    return result.returncode, out, result.stderr
-
-
-class TestPromptInjectedPicker:
-    """Tests for the block-and-preview flow (Turn 1 + Turn 2)."""
-
-    _CRED = "ScdsJCCKLSLKDKLCNLKCEINK2233as"
-
-    def test_detection_blocks_prompt(self, tmp_path):
-        """Detection: hook exits 2 (prompt blocked)."""
-        state = tmp_path / "state"
-        state.mkdir(mode=0o700)
-        rc, out, stderr = _run_hook_with_state(state, f"here is my new pass CSKC:{self._CRED}")
-        assert rc == 2
-        assert "leak-guard" in stderr
-
-    def test_choice_allow_resends_original(self, tmp_path):
-        """Turn 2 'a': exits 0 and sends original prompt."""
-        state = tmp_path / "state"
-        state.mkdir(mode=0o700)
-        original = f"here is my pass CSKC:{self._CRED}"
-        _make_pending(state, original, [self._CRED])
-        rc, out, _ = _run_hook_with_state(state, "a")
-        assert rc == 0
-        ctx = (out or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
-        assert original in ctx
-
-    def test_choice_redact_uses_semantic_tags(self, tmp_path):
-        """Turn 2 Enter: exits 0 and uses semantic redaction tags."""
-        state = tmp_path / "state"
-        state.mkdir(mode=0o700)
-        original = f"here is my pass CSKC:{self._CRED}"
-        _make_pending(state, original, [self._CRED])
-        rc, out, _ = _run_hook_with_state(state, "")  # Enter = redact
-        assert rc == 0
-        ctx = (out or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
-        assert "[REDACTED:" in ctx
-        assert self._CRED not in ctx
-
-    def test_choice_expired_falls_through(self, tmp_path):
-        """Expired pending file: choice reply falls through to normal scan."""
-        state = tmp_path / "state"
-        state.mkdir(mode=0o700)
-        _make_pending(state, "some clean prompt", [], expires_delta=-1)
-        rc, out, _ = _run_hook_with_state(state, "a")
-        assert rc == 0
-
-    def test_no_pending_no_intercept(self, tmp_path):
-        """No pending file: single-letter prompt is not intercepted as choice."""
-        state = tmp_path / "state"
-        state.mkdir(mode=0o700)
-        rc, out, _ = _run_hook_with_state(state, "a")
-        assert rc == 0
-
-    def test_redaction_blocks_prompt(self, tmp_path):
-        """Detection: prompt is blocked (exit 2), credential not in stdout."""
-        state = tmp_path / "state"
-        state.mkdir(mode=0o700)
-        rc, out, stderr = _run_hook_with_state(state, f"here is my new pass CSKC:{self._CRED}")
-        assert rc == 2
-        assert self._CRED not in json.dumps(out or {})
-
 class TestTrainingMode:
     def test_capture_skipped_without_author_flag(self, tmp_path):
         """Without LEAK_GUARD_AUTHOR=1, no training_log.jsonl is written."""
@@ -757,8 +633,8 @@ class TestTrainingMode:
         log = tmp_path / "training_log.jsonl"
         assert not log.exists(), "training_log.jsonl must NOT be written without LEAK_GUARD_AUTHOR=1"
 
-    def test_capture_written_with_author_flag(self, tmp_path):
-        """With LEAK_GUARD_AUTHOR=1, training_log.jsonl is written per finding."""
+    def test_hook_does_not_write_training_log(self, tmp_path):
+        """hook-user-prompt is now pass-through; training_log.jsonl is never written."""
         cred = "CSKC:Scds" + "JCCKLSLKDKLCNLKCEINK2233as"
         env = {**os.environ, "LEAK_GUARD_STATE_DIR": str(tmp_path), "LEAK_GUARD_AUTHOR": "1"}
         r = subprocess.run(
@@ -768,16 +644,9 @@ class TestTrainingMode:
                               "session_id": "train-test"}),
             capture_output=True, text=True, env=env, timeout=30,
         )
+        assert r.returncode == 0  # pass-through always
         log = tmp_path / "training_log.jsonl"
-        assert log.exists(), "training_log.jsonl should be written when LEAK_GUARD_AUTHOR=1"
-        entries = [json.loads(l) for l in log.read_text().splitlines() if l.strip()]
-        assert len(entries) >= 1
-        e = entries[0]
-        assert e["verdict"] == "pending"
-        assert "hash" in e
-        assert "raw_match" not in e
-        assert "ts" in e
-        assert "session_id" in e
+        assert not log.exists(), "hook-user-prompt no longer writes training_log (proxy handles)"
 
     def test_verdict_updates_pending_entry(self, tmp_path):
         log = tmp_path / "training_log.jsonl"
@@ -1144,15 +1013,16 @@ class TestNerInstruction:
         ctx = out.get("hookSpecificOutput", {}).get("additionalContext", "")
         assert "PII Review" in ctx
 
-    def test_prompt_with_secrets_no_ner(self):
-        """Prompts with findings should NOT also get NER — findings already handled."""
+    def test_long_prompt_with_secrets_gets_ner(self):
+        """Long prompts with secrets also get NER instruction — proxy handles redaction."""
         secret_prompt = "my key is " + "ghp_" + "R8mN2kLpQ7vXdYeZwBtA5cJfHsUoIgPn3m1" + " please use it " * 20
         assert len(secret_prompt) >= 200
         rc, out, _ = run_hook("hook-user-prompt", {"prompt": secret_prompt})
-        if out:
-            ctx = out.get("hookSpecificOutput", {}).get("additionalContext", "")
-            # Should have redaction context, NOT NER instruction
-            assert "PII Review" not in ctx
+        assert rc == 0  # pass-through always
+        # Long prompts get NER instruction regardless of findings
+        assert out is not None
+        ctx = out.get("hookSpecificOutput", {}).get("additionalContext", "")
+        assert "PII Review" in ctx
 
 
 class TestConfidenceScoring:
@@ -1274,103 +1144,6 @@ class TestNerCandidates:
                 assert h.raw_match not in h.preview
 
 
-class TestBlockAndPreview:
-    """Component 1: Block-and-preview — exit 2 on findings, stderr preview, Enter/a choices."""
-
-    def test_findings_exit_2(self, tmp_path):
-        """Findings cause exit 2 (prompt blocked)."""
-        state = tmp_path / "state"
-        state.mkdir(mode=0o700)
-        aws = "AKIA" + "Y3FDSNDKFK" + "SIDJSW"
-        rc, out, stderr = _run_hook_with_state(state, f"My key is {aws}")
-        assert rc == 2, f"Expected exit 2 (block), got {rc}"
-
-    def test_preview_in_stderr(self, tmp_path):
-        """Preview with >>>value<<< markers appears in stderr."""
-        state = tmp_path / "state"
-        state.mkdir(mode=0o700)
-        aws = "AKIA" + "Y3FDSNDKFK" + "SIDJSW"
-        rc, out, stderr = _run_hook_with_state(state, f"My key is {aws}")
-        assert ">>>" in stderr and "<<<" in stderr
-        assert "leak-guard" in stderr
-
-    def test_pending_action_written(self, tmp_path):
-        """pending_action.json is written with findings data."""
-        state = tmp_path / "state"
-        state.mkdir(mode=0o700)
-        aws = "AKIA" + "Y3FDSNDKFK" + "SIDJSW"
-        _run_hook_with_state(state, f"My key is {aws}")
-        pending = state / "pending_action.json"
-        assert pending.exists()
-        data = json.loads(pending.read_text())
-        assert "findings" in data
-        assert "prompt" in data
-        assert "expires_at" in data
-        assert len(data["findings"]) > 0
-        f = data["findings"][0]
-        assert "rule_id" in f
-        assert "raw_match" in f
-        assert "redaction_tag" in f
-        assert "confidence" in f
-
-    def test_clean_prompt_exits_0(self, tmp_path):
-        """No findings -> exit 0 (prompt passes through)."""
-        state = tmp_path / "state"
-        state.mkdir(mode=0o700)
-        rc, out, _ = _run_hook_with_state(state, "What is the weather?")
-        assert rc == 0
-
-    def test_redact_choice_sends_semantic_tags(self, tmp_path):
-        """Turn 2 Enter/empty -> redact with semantic tags via additionalContext."""
-        state = tmp_path / "state"
-        state.mkdir(mode=0o700)
-        ssn = "123-45-6789"
-        original = f"My SSN is {ssn}, is it safe?"
-        _make_pending(state, original, [ssn],
-                      findings=[{"rule_id": "us-ssn", "category": "pii",
-                                 "severity": "high", "description": "SSN",
-                                 "raw_match": ssn, "confidence": 0.90,
-                                 "redaction_tag": "[REDACTED:us-ssn]"}])
-        rc, out, _ = _run_hook_with_state(state, "")  # Enter = redact
-        assert rc == 0
-        ctx = (out or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
-        assert "[REDACTED:us-ssn]" in ctx
-        assert ssn not in ctx
-
-    def test_allow_choice_sends_original(self, tmp_path):
-        """Turn 2 'a' -> allow, sends original prompt."""
-        state = tmp_path / "state"
-        state.mkdir(mode=0o700)
-        ssn = "123-45-6789"
-        original = f"My SSN is {ssn}, is it safe?"
-        _make_pending(state, original, [ssn],
-                      findings=[{"rule_id": "us-ssn", "category": "pii",
-                                 "severity": "high", "description": "SSN",
-                                 "raw_match": ssn, "confidence": 0.90,
-                                 "redaction_tag": "[REDACTED:us-ssn]"}])
-        rc, out, _ = _run_hook_with_state(state, "a")  # allow
-        assert rc == 0
-        ctx = (out or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
-        assert original in ctx
-
-    def test_allow_once_still_bypasses(self, tmp_path):
-        """[allow-once] prefix still bypasses all findings (exit 0)."""
-        state = tmp_path / "state"
-        state.mkdir(mode=0o700)
-        aws = "AKIA" + "Y3FDSNDKFK" + "SIDJSW"
-        rc, out, _ = _run_hook_with_state(state, f"[allow-once] my key {aws}")
-        assert rc == 0
-
-    def test_long_reply_not_intercepted_as_choice(self, tmp_path):
-        """Responses >20 chars with active pending are treated as new prompts."""
-        state = tmp_path / "state"
-        state.mkdir(mode=0o700)
-        _make_pending(state, "original", ["val"])
-        long_msg = "This is a completely new prompt about something else entirely"
-        rc, out, _ = _run_hook_with_state(state, long_msg)
-        assert rc == 0
-
-
 class TestSymbolicFingerprint:
     """Component 3: Symbolic FP reduction — fingerprint without raw values."""
 
@@ -1408,61 +1181,8 @@ class TestSymbolicFingerprint:
         fp = sc._build_symbolic_fingerprint(f, f"hash = {val}")
         assert fp["charset"] == "hex"
 
-    def test_symbolic_context_in_redact_instruction(self, tmp_path):
-        """Borderline findings include symbolic fingerprint in redact instruction."""
-        state = tmp_path / "state"
-        state.mkdir(mode=0o700)
-        val = "xK9" + "mP2" + "qL7" + "nR4" + "xW5" + "bYz" + "D9c" + "Hf6" + "eG3" + "tUo"
-        original = f"secret = '{val}'"
-        _make_pending(state, original, [val],
-                      findings=[{"rule_id": "high-entropy-base64", "category": "pii",
-                                 "severity": "high", "description": "entropy hit",
-                                 "raw_match": val, "confidence": 0.50,
-                                 "redaction_tag": "[REDACTED:suspicious-value]"}])
-        rc, out, _ = _run_hook_with_state(state, "")  # redact
-        ctx = (out or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
-        # Symbolic fingerprint metadata should be present
-        assert "entropy" in ctx.lower() or "symbolic" in ctx.lower() or "profile" in ctx.lower()
-
-
 class TestFeedbackLoop:
     """Component 6: FP profile — learn from user allow decisions without raw values."""
-
-    def test_fp_decision_logged_on_allow(self, tmp_path):
-        """Allow choice logs symbolic FP profile to fp_profile.jsonl."""
-        state = tmp_path / "state"
-        state.mkdir(mode=0o700)
-        val = "xK9" + "mP2" + "qL7" + "nR4" + "xW5" + "bYz" + "D9c" + "Hf6" + "eG3" + "tUo"
-        original = f"cache_key = {val}"
-        _make_pending(state, original, [val],
-                      findings=[{"rule_id": "high-entropy-base64", "category": "pii",
-                                 "severity": "high", "description": "entropy",
-                                 "raw_match": val, "confidence": 0.50,
-                                 "redaction_tag": "[REDACTED:suspicious-value]"}])
-        rc, out, _ = _run_hook_with_state(state, "a")  # allow
-        fp_log = state / "fp_profile.jsonl"
-        assert fp_log.exists()
-        entries = [json.loads(l) for l in fp_log.read_text().splitlines() if l.strip()]
-        assert len(entries) >= 1
-        e = entries[0]
-        assert e["rule_id"] == "high-entropy-base64"
-        assert "length" in e
-        assert "raw_match" not in e  # raw value never stored
-
-    def test_fp_profile_no_raw_values(self, tmp_path):
-        """FP profile must never contain raw matched values."""
-        state = tmp_path / "state"
-        state.mkdir(mode=0o700)
-        val = "xK9" + "mP2" + "qL7" + "nR4" + "xW5" + "bYz" + "D9c" + "Hf6" + "eG3" + "tUo"
-        original = f"token = {val}"
-        _make_pending(state, original, [val],
-                      findings=[{"rule_id": "high-entropy-base64", "category": "pii",
-                                 "severity": "high", "description": "entropy",
-                                 "raw_match": val, "confidence": 0.50,
-                                 "redaction_tag": "[REDACTED:suspicious-value]"}])
-        _run_hook_with_state(state, "a")
-        content = (state / "fp_profile.jsonl").read_text()
-        assert val not in content
 
     def test_match_fp_profile(self):
         """_match_fp_profile returns previous allow count when profile matches."""
