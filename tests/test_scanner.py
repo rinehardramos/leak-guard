@@ -1180,3 +1180,122 @@ class TestNerInstruction:
             ctx = out.get("hookSpecificOutput", {}).get("additionalContext", "")
             # Should have redaction context, NOT NER instruction
             assert "PII Review" not in ctx
+
+
+class TestConfidenceScoring:
+    """Component 5: Confidence scoring — every finding gets a 0.0-1.0 score."""
+
+    def test_vendor_rule_high_confidence(self):
+        f = sc.Finding("github-pat", "secret", "", 0, "[R]")
+        assert sc._confidence(f) == 0.95
+
+    def test_structured_pii_confidence(self):
+        f = sc.Finding("us-ssn", "pii", "", 0, "[R]")
+        assert sc._confidence(f) == 0.90
+
+    def test_db_connection_confidence(self):
+        f = sc.Finding("db-connection-string", "secret", "", 0, "[R]")
+        assert sc._confidence(f) == 0.90
+
+    def test_assigned_password_medium_confidence(self):
+        f = sc.Finding("assigned-password", "pii", "", 0, "[R]")
+        assert sc._confidence(f) == 0.70
+
+    def test_entropy_low_confidence(self):
+        f = sc.Finding("high-entropy-base64", "pii", "", 0, "[R]")
+        assert sc._confidence(f) == 0.50
+
+    def test_unknown_rule_default_confidence(self):
+        f = sc.Finding("some-unknown-rule", "secret", "", 0, "[R]")
+        assert sc._confidence(f) == 0.60
+
+
+class TestSemanticRedaction:
+    """Component 2: Semantic redaction — typed tags instead of generic [REDACTED]."""
+
+    def test_pii_rule_uses_rule_id(self):
+        f = sc.Finding("credit-card", "pii", "", 0, "[R]")
+        assert sc._redaction_tag(f) == "[REDACTED:credit-card]"
+
+    def test_email_uses_rule_id(self):
+        f = sc.Finding("email", "pii", "", 0, "[R]")
+        assert sc._redaction_tag(f) == "[REDACTED:email]"
+
+    def test_vendor_secret_uses_credential(self):
+        f = sc.Finding("github-pat", "secret", "", 0, "[R]")
+        assert sc._redaction_tag(f) == "[REDACTED:credential]"
+
+    def test_db_connection_string_tag(self):
+        f = sc.Finding("db-connection-string", "secret", "", 0, "[R]")
+        assert sc._redaction_tag(f) == "[REDACTED:connection-string]"
+
+    def test_url_credential_tag(self):
+        f = sc.Finding("url-embedded-credential", "secret", "", 0, "[R]")
+        assert sc._redaction_tag(f) == "[REDACTED:url-credential]"
+
+    def test_ner_name_tag(self):
+        f = sc.Finding("ner-name", "pii", "", 0, "[R]")
+        assert sc._redaction_tag(f) == "[REDACTED:name]"
+
+    def test_ner_address_tag(self):
+        f = sc.Finding("ner-address", "pii", "", 0, "[R]")
+        assert sc._redaction_tag(f) == "[REDACTED:address]"
+
+    def test_entropy_uses_suspicious_value(self):
+        f = sc.Finding("high-entropy-base64", "pii", "", 0, "[R]")
+        assert sc._redaction_tag(f) == "[REDACTED:suspicious-value]"
+
+    def test_fuzzy_uses_suspicious_value(self):
+        f = sc.Finding("fuzzy-prefixed-credential", "secret", "", 0, "[R]")
+        assert sc._redaction_tag(f) == "[REDACTED:suspicious-value]"
+
+
+class TestNerCandidates:
+    """Component 4: Local NER — regex-based candidate extraction with context scoring."""
+
+    def test_name_near_medical_keyword_detected(self):
+        text = "The patient John Smith was diagnosed with pneumonia on 03/15/2025."
+        hits = sc._scan_ner_candidates(text, source="<test>")
+        assert any(f.rule_id == "ner-name" for f in hits)
+
+    def test_name_near_legal_keyword_detected(self):
+        text = "The defendant Jane Doe filed a motion in court on Monday."
+        hits = sc._scan_ner_candidates(text, source="<test>")
+        assert any(f.rule_id == "ner-name" for f in hits)
+
+    def test_name_without_context_not_detected(self):
+        """A name with no medical/legal/financial context should score below threshold."""
+        text = "Please refactor the Hello World function in the codebase."
+        hits = sc._scan_ner_candidates(text, source="<test>")
+        assert not any(f.rule_id == "ner-name" for f in hits)
+
+    def test_address_detected(self):
+        text = "Send the package to 1234 Oak Street, Springfield."
+        hits = sc._scan_ner_candidates(text, source="<test>")
+        assert any(f.rule_id == "ner-address" for f in hits)
+
+    def test_dated_record_detected(self):
+        text = "The patient was diagnosed with diabetes on 01/15/2024 at the clinic."
+        hits = sc._scan_ner_candidates(text, source="<test>")
+        assert any(f.rule_id == "ner-dated-record" for f in hits)
+
+    def test_score_increases_with_multiple_keywords(self):
+        """Two context keywords should score higher than one."""
+        text_one = "The patient John Smith visited today."
+        text_two = "The patient John Smith was diagnosed with pneumonia at the hospital."
+        score_one = sc._score_ner_candidate_text(text_one, "name")
+        score_two = sc._score_ner_candidate_text(text_two, "name")
+        assert score_two > score_one
+
+    def test_ner_finding_has_correct_category(self):
+        text = "The patient John Smith was diagnosed with pneumonia."
+        hits = sc._scan_ner_candidates(text, source="<test>")
+        for h in hits:
+            assert h.category == "pii"
+
+    def test_ner_finding_raw_match_not_in_preview(self):
+        text = "The patient John Smith was diagnosed with pneumonia."
+        hits = sc._scan_ner_candidates(text, source="<test>")
+        for h in hits:
+            if h.raw_match:
+                assert h.raw_match not in h.preview

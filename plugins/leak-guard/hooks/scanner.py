@@ -1521,6 +1521,174 @@ _HEURISTIC_RULE_IDS = {"high-entropy-base64", "high-entropy-hex",
 # ── Task 6: Borderline findings that benefit from LLM contextual judgment ──
 _BORDERLINE_RULES = {"high-entropy-base64", "high-entropy-hex", "fuzzy-prefixed-credential"}
 
+# ── Component 5: Confidence scoring (0.0-1.0 per finding) ────────────────
+_CONFIDENCE_MAP: dict[str, float] = {
+    # Vendor-specific — high confidence
+    "aws-access-key-id": 0.95, "aws-secret-access-key": 0.95,
+    "github-pat": 0.95, "github-oauth": 0.95, "github-app-token": 0.95,
+    "github-user-token": 0.95, "github-fine-grained-pat": 0.95,
+    "anthropic-api-key": 0.95, "openai-api-key": 0.95,
+    "stripe-secret-key": 0.95, "sendgrid-api-key": 0.95,
+    "twilio-api-key": 0.95, "slack-token": 0.95, "slack-webhook": 0.95,
+    "npm-token": 0.95, "pypi-token": 0.95, "google-api-key": 0.95,
+    "gcp-api-key": 0.95, "private-key-header": 0.95, "private-key-encrypted": 0.95,
+    "gitlab-pat": 0.95, "gitlab-pipeline-token": 0.95,
+    "digitalocean-pat": 0.95, "digitalocean-oauth": 0.95,
+    "heroku-api-key": 0.95, "discord-bot-token": 0.95,
+    "mailgun-api-key": 0.95, "telegram-bot-token": 0.95,
+    "hashicorp-vault-token": 0.95, "hashicorp-vault-batch": 0.95,
+    "square-access-token": 0.95, "shopify-access-token": 0.95,
+    "jwt-token": 0.90, "bearer-header": 0.90, "curl-auth-header": 0.90,
+    # Structured PII — high confidence
+    "us-ssn": 0.90, "credit-card": 0.90, "iban": 0.90,
+    "uk-ni-number": 0.90, "ca-sin": 0.90, "au-tfn": 0.90,
+    "in-aadhaar": 0.90, "mx-curp": 0.90, "de-personalausweis": 0.90,
+    "email": 0.80, "us-phone": 0.80, "us-zip": 0.70, "ipv4-private": 0.60,
+    # Connection strings — high confidence
+    "db-connection-string": 0.90, "url-embedded-credential": 0.90,
+    # Contextual — medium confidence
+    "assigned-password": 0.70, "assigned-token": 0.70,
+    "assigned-api-key": 0.70, "assigned-secret": 0.70,
+    # Heuristic — lower confidence
+    "high-entropy-base64": 0.50, "high-entropy-hex": 0.50,
+    "fuzzy-prefixed-credential": 0.50,
+    # NER candidates — medium confidence (actual score from _score_ner_candidate)
+    "ner-name": 0.70, "ner-address": 0.70, "ner-dated-record": 0.70,
+}
+
+
+def _confidence(finding: Finding) -> float:
+    """Return confidence score 0.0-1.0 for a finding."""
+    return _CONFIDENCE_MAP.get(finding.rule_id, 0.60)
+
+
+# ── Component 2: Semantic redaction tags ──────────────────────────────────
+
+_REDACTION_TAG_OVERRIDES: dict[str, str] = {
+    "db-connection-string": "[REDACTED:connection-string]",
+    "url-embedded-credential": "[REDACTED:url-credential]",
+}
+
+_SUSPICIOUS_VALUE_RULES = _BORDERLINE_RULES  # high-entropy-*, fuzzy-prefixed-credential
+
+
+def _redaction_tag(finding: Finding) -> str:
+    """Return a semantic redaction tag based on finding type."""
+    rid = finding.rule_id
+    # NER candidates — extract type from rule_id prefix
+    if rid.startswith("ner-"):
+        ner_type = rid.split("-", 1)[1]  # ner-name → name
+        return f"[REDACTED:{ner_type}]"
+    # Specific overrides
+    if rid in _REDACTION_TAG_OVERRIDES:
+        return _REDACTION_TAG_OVERRIDES[rid]
+    # Heuristic/entropy — suspicious value
+    if rid in _SUSPICIOUS_VALUE_RULES:
+        return "[REDACTED:suspicious-value]"
+    # Vendor credentials → generic credential tag
+    if finding.category == "secret":
+        return "[REDACTED:credential]"
+    # PII → use rule_id directly
+    if finding.category == "pii":
+        return f"[REDACTED:{rid}]"
+    return "[REDACTED:suspicious-value]"
+
+
+# ── Component 4: Symbolic NER — local regex + context scoring ─────────────
+
+_NER_CANDIDATE_PATTERNS: list[tuple[str, re.Pattern, str]] = [
+    # Full name candidates (2-3 title-case words)
+    ("ner-name",
+     re.compile(r'\b[A-Z][a-z]{1,15}\s+[A-Z][a-z]{1,15}(?:\s+[A-Z][a-z]{1,15})?\b'),
+     "name"),
+    # Street address candidates (number + street type)
+    ("ner-address",
+     re.compile(r'\b\d{1,5}\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s+'
+                r'(?:St(?:reet)?|Ave(?:nue)?|Blvd|Rd|Road|Dr(?:ive)?|'
+                r'Ln|Lane|Ct|Court|Way|Pl(?:ace)?|Pkwy)\b\.?', re.I),
+     "address"),
+    # Date near medical/legal keywords
+    ("ner-dated-record",
+     re.compile(r'(?i)(?:diagnosed|admitted|discharged|filed|sentenced|'
+                r'prescribed|examined)\b.{0,30}\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b'),
+     "dated-record"),
+]
+
+_NER_CONTEXT_KEYWORDS: dict[str, frozenset[str]] = {
+    "medical": frozenset({
+        "patient", "diagnosed", "treatment", "hospital", "clinic",
+        "medical", "prescription", "symptom", "condition", "surgery",
+        "nurse", "doctor", "physician", "therapist",
+    }),
+    "legal": frozenset({
+        "plaintiff", "defendant", "filed", "court", "case",
+        "sentenced", "attorney", "counsel", "verdict", "hearing",
+    }),
+    "financial": frozenset({
+        "account", "balance", "deposit", "withdrawal", "routing",
+        "beneficiary", "wire", "transfer",
+    }),
+}
+
+_NER_SCORE_THRESHOLD = 0.5
+
+
+def _score_ner_candidate_text(text: str, ner_type: str) -> float:
+    """Return confidence score 0.0-1.0 for a NER candidate based on context keywords."""
+    window = text.lower()
+    # Address and dated-record patterns are structurally specific — higher base score.
+    # Name patterns (title-case words) are ambiguous — need context to elevate.
+    base = 0.5 if ner_type in ("address", "dated-record") else 0.3
+    score = base
+    for domain, keywords in _NER_CONTEXT_KEYWORDS.items():
+        hits = sum(1 for kw in keywords if kw in window)
+        if hits >= 2:
+            score += 0.4
+        elif hits == 1:
+            score += 0.2
+    return min(score, 1.0)
+
+
+def _score_ner_candidate(match: re.Match, text: str, ner_type: str) -> float:
+    """Return confidence score 0.0-1.0 for a NER candidate."""
+    window = text[max(0, match.start() - 100):match.end() + 100]
+    return _score_ner_candidate_text(window, ner_type)
+
+
+def _scan_ner_candidates(text: str, source: str = "") -> list[Finding]:
+    """Stage 1: Extract NER candidates via regex and score by context keywords.
+
+    Only candidates scoring >= _NER_SCORE_THRESHOLD are returned as findings.
+    """
+    if not text or len(text) < 20:
+        return []
+    findings: list[Finding] = []
+    seen: set[str] = set()
+    for rule_id, pattern, ner_type in _NER_CANDIDATE_PATTERNS:
+        for m in pattern.finditer(text):
+            matched = m.group(0)
+            if matched in seen:
+                continue
+            score = _score_ner_candidate(m, text, ner_type)
+            if score < _NER_SCORE_THRESHOLD:
+                continue
+            seen.add(matched)
+            upto = text[:m.start()]
+            line_no = upto.count("\n") + 1
+            severity = "high" if score >= 0.7 else "medium"
+            findings.append(Finding(
+                rule_id=rule_id,
+                category="pii",
+                description=f"NER {ner_type} candidate (confidence: {score:.1f})",
+                line=line_no,
+                preview=redact_preview(matched, ner_type),
+                severity=severity,
+                source=source,
+                raw_match=matched,
+            ))
+    return findings
+
+
 # ── Task 7: Claude-as-NER for unstructured PII ─────────────────────────────
 _NER_MIN_TEXT_LENGTH = 200
 
