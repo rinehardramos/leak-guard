@@ -2,7 +2,7 @@
 
 > Local-first PII & secret scanner for Claude Code. Redacts leaks before they reach the model.
 
-[![Version](https://img.shields.io/badge/version-0.3.0-blue)](https://github.com/rinehardramos/leak-guard)
+[![Version](https://img.shields.io/badge/version-0.5.0-blue)](https://github.com/rinehardramos/leak-guard)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Claude Code Plugin](https://img.shields.io/badge/Claude%20Code-plugin-orange)](https://claude.ai/settings/plugins)
 
@@ -26,9 +26,12 @@
 
 ## What it does
 
-Every time you submit a prompt, Claude reads a file, or runs a command — leak-guard scans the content locally for secrets and PII. If something is found, the raw value is redacted inline with `[REDACTED]` and Claude is notified via an injected system note. The raw value never leaves your machine.
+Every time you submit a prompt, Claude reads a file, or runs a command — leak-guard scans the content locally for secrets and PII. If something is found, the prompt is **blocked before reaching Anthropic** (exit 2). You see a highlighted preview in your terminal showing exactly what was flagged, then choose:
 
-The hook always exits 0 (no hard blocking of prompt delivery). Claude responds naturally, starting with what was detected and redacted.
+- **Enter** — redact with semantic `[REDACTED:{type}]` tags and send
+- **a** — allow these values (adds to local allowlist) and send original
+
+Raw sensitive values never leave your machine unless you explicitly allow them.
 
 To bypass all findings for a single submission, prefix your prompt with `[allow-once]`.
 
@@ -49,11 +52,15 @@ scanner.py scans prompt text
    /         \
  yes           no
   |             |
-Redact values   Pass through unchanged
-Inject SYSTEM NOTE via additionalContext
+Exit 2 (BLOCK)  Pass through unchanged
+Show >>>highlighted<<< preview in terminal
+        |
+  User replies:
+  Enter = redact with [REDACTED:{type}] tags
+  a     = allow + persist to allowlist
         |
         v
-Claude responds — reports what was caught and redacted
+Claude responds with redacted or original prompt
 ```
 
 All scanning runs 100% locally. No data is sent to any external service.
@@ -253,6 +260,16 @@ MIT — see [LICENSE](LICENSE).
 ---
 
 ## Changelog
+
+### v0.5.0 (2026-04-11)
+- **Privacy guarantee:** Raw sensitive values never reach Anthropic unless user explicitly allows
+- **Block-and-preview:** Hook exits 2 on findings, shows highlighted preview, Enter = redact / a = allow
+- **Semantic redaction:** Typed `[REDACTED:{type}]` tags so Claude can reason about the task
+- **Symbolic FP reduction:** Borderline findings include metadata (entropy, charset, position) for Claude's judgment — raw value never sent
+- **Local NER:** Regex-based name/address/dated-record extraction with context keyword scoring
+- **Confidence scoring:** Every finding gets a 0.0-1.0 confidence displayed in preview
+- **Feedback loop:** User allow decisions build local FP profile (symbolic only, no raw values)
+- **PostToolUse NER:** Tool output scanned for unstructured PII (names near medical/legal keywords)
 
 ### v0.4.0 (2026-04-11)
 - **Performance:** Normalize text once per scan (was 4x); cache PII rules and filename blocklist by mtime
