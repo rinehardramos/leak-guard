@@ -1423,3 +1423,58 @@ class TestSymbolicFingerprint:
         ctx = (out or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
         # Symbolic fingerprint metadata should be present
         assert "entropy" in ctx.lower() or "symbolic" in ctx.lower() or "profile" in ctx.lower()
+
+
+class TestFeedbackLoop:
+    """Component 6: FP profile — learn from user allow decisions without raw values."""
+
+    def test_fp_decision_logged_on_allow(self, tmp_path):
+        """Allow choice logs symbolic FP profile to fp_profile.jsonl."""
+        state = tmp_path / "state"
+        state.mkdir(mode=0o700)
+        val = "xK9" + "mP2" + "qL7" + "nR4" + "xW5" + "bYz" + "D9c" + "Hf6" + "eG3" + "tUo"
+        original = f"cache_key = {val}"
+        _make_pending(state, original, [val],
+                      findings=[{"rule_id": "high-entropy-base64", "category": "pii",
+                                 "severity": "high", "description": "entropy",
+                                 "raw_match": val, "confidence": 0.50,
+                                 "redaction_tag": "[REDACTED:suspicious-value]"}])
+        rc, out, _ = _run_hook_with_state(state, "a")  # allow
+        fp_log = state / "fp_profile.jsonl"
+        assert fp_log.exists()
+        entries = [json.loads(l) for l in fp_log.read_text().splitlines() if l.strip()]
+        assert len(entries) >= 1
+        e = entries[0]
+        assert e["rule_id"] == "high-entropy-base64"
+        assert "length" in e
+        assert "raw_match" not in e  # raw value never stored
+
+    def test_fp_profile_no_raw_values(self, tmp_path):
+        """FP profile must never contain raw matched values."""
+        state = tmp_path / "state"
+        state.mkdir(mode=0o700)
+        val = "xK9" + "mP2" + "qL7" + "nR4" + "xW5" + "bYz" + "D9c" + "Hf6" + "eG3" + "tUo"
+        original = f"token = {val}"
+        _make_pending(state, original, [val],
+                      findings=[{"rule_id": "high-entropy-base64", "category": "pii",
+                                 "severity": "high", "description": "entropy",
+                                 "raw_match": val, "confidence": 0.50,
+                                 "redaction_tag": "[REDACTED:suspicious-value]"}])
+        _run_hook_with_state(state, "a")
+        content = (state / "fp_profile.jsonl").read_text()
+        assert val not in content
+
+    def test_match_fp_profile(self):
+        """_match_fp_profile returns previous allow count when profile matches."""
+        profile = {"rule_id": "high-entropy-base64", "charset": "base64url",
+                    "position": "rhs_of_assignment", "length": 40}
+        history = [
+            {"rule_id": "high-entropy-base64", "charset": "base64url",
+             "position": "rhs_of_assignment", "length": 38},
+            {"rule_id": "high-entropy-base64", "charset": "base64url",
+             "position": "rhs_of_assignment", "length": 42},
+            {"rule_id": "email", "charset": "mixed",
+             "position": "standalone", "length": 20},
+        ]
+        count = sc._match_fp_profile(profile, history)
+        assert count == 2  # two matching entries

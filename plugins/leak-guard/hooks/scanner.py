@@ -62,6 +62,7 @@ CUSTOM_RULES_FILE = STATE_DIR / "custom_rules.toml"
 VERIFIER_CONFIG = STATE_DIR / "verifier.toml"
 PENDING_VERIFICATIONS = STATE_DIR / "pending_verifications.jsonl"
 VERIFIER_FEEDBACK = STATE_DIR / "verifier_feedback.jsonl"
+FP_PROFILE = STATE_DIR / "fp_profile.jsonl"
 
 # Severity → policy
 SECRET_CATEGORIES = {"secret", "credential", "cloud-key", "private-key"}
@@ -1462,6 +1463,7 @@ def _handle_choice(choice: str, pending: dict) -> int:
             raw = f.get("raw_match", "")
             if raw:
                 _append_literal(raw, "user allowed via block-and-preview")
+                _log_fp_decision(f, original_prompt)
         emit_allow_modified(original_prompt)
         return 0
 
@@ -1477,6 +1479,17 @@ def _handle_choice(choice: str, pending: dict) -> int:
 
     # Add symbolic fingerprints for borderline findings
     borderline = [f for f in findings if f.get("rule_id") in _BORDERLINE_RULES]
+
+    # Load FP history for profile matching
+    fp_history: list[dict] = []
+    if FP_PROFILE.exists():
+        try:
+            fp_history = [json.loads(l) for l in
+                          FP_PROFILE.read_text(encoding="utf-8").splitlines()
+                          if l.strip()]
+        except Exception:
+            pass
+
     if borderline:
         fp_lines = ["\n\nleak-guard: Borderline values were redacted. Symbolic profiles:"]
         for f in borderline:
@@ -1485,6 +1498,9 @@ def _handle_choice(choice: str, pending: dict) -> int:
                 dummy_finding = Finding(f["rule_id"], f.get("category", ""), "",
                                         0, "", raw_match=raw)
                 fp = _build_symbolic_fingerprint(dummy_finding, original_prompt)
+                profile = {"rule_id": fp["rule_id"], "charset": fp["charset"],
+                           "position": fp["position"], "length": fp["length"]}
+                match_count = _match_fp_profile(profile, fp_history)
                 fp_lines.append(
                     f"  Rule: {fp['rule_id']}\n"
                     f"  Length: {fp['length']} chars, entropy: {fp['entropy']} bits/char, "
@@ -1493,6 +1509,10 @@ def _handle_choice(choice: str, pending: dict) -> int:
                     f"  Context keywords: {', '.join(fp['context_keywords']) or 'none'}\n"
                     f"  Adjacent code: {fp['adjacent_code']}"
                 )
+                if match_count > 0:
+                    fp_lines.append(
+                        f"  Previously allowed: {match_count} time(s) — likely false positive."
+                    )
         fp_lines.append(
             "\nIf these profiles suggest computed/derived values rather than "
             "credentials, inform the user they were likely false positives and "
@@ -1625,6 +1645,42 @@ def _build_symbolic_fingerprint(finding: Finding, text: str) -> dict:
         "has_vendor_prefix": any(val.startswith(p) for p in _VENDOR_PREFIXES),
         "adjacent_code": window,
     }
+
+
+def _log_fp_decision(finding_data: dict, prompt: str) -> None:
+    """Log a symbolic FP profile when the user chooses 'allow'. No raw values stored."""
+    try:
+        ensure_state_dir()
+        raw = finding_data.get("raw_match", "")
+        dummy = Finding(finding_data["rule_id"], finding_data.get("category", ""),
+                        "", 0, "", raw_match=raw)
+        fp = _build_symbolic_fingerprint(dummy, prompt)
+        # Strip adjacent_code and add timestamp — never store raw values
+        entry = {
+            "ts": time.time(),
+            "rule_id": fp["rule_id"],
+            "length": fp["length"],
+            "entropy": fp["entropy"],
+            "charset": fp["charset"],
+            "position": fp["position"],
+            "context_keywords": fp["context_keywords"],
+            "has_vendor_prefix": fp["has_vendor_prefix"],
+        }
+        with FP_PROFILE.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
+def _match_fp_profile(profile: dict, history: list[dict]) -> int:
+    """Return count of previous allow decisions matching this profile."""
+    count = 0
+    for h in history:
+        if (h.get("rule_id") == profile.get("rule_id")
+                and h.get("charset") == profile.get("charset")
+                and h.get("position") == profile.get("position")):
+            count += 1
+    return count
 
 
 # Prefix the user can prepend to bypass heuristic (non-gitleaks) findings for one submission.
