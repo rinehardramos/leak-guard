@@ -4,6 +4,7 @@
 # literal        — exact strings to ignore (case-sensitive)
 # rule_ids       — rule IDs to fully disable (e.g. "us-zip" if too noisy)
 # path_globs     — paths where ALL rules are suppressed (fnmatch globs)
+# bash_globs     — bash commands whose PostToolUse output is suppressed
 # silent_blocks  — set to true in your USER allowlist to suppress stderr
 #                  notifications (blocks still happen; only the visible
 #                  warning is hidden). Default: false.
@@ -38,4 +39,44 @@ path_globs = [
     "*/.git/*",
     "*/dist/*",
     "*/build/*",
+    # Claude Code tooling — plugin node IDs, MCP configs, project memory,
+    # and skill cache all trigger entropy/email false positives.
+    "*/.claude/settings.json",
+    "**/.mcp.json",
+    "*/.claude/mcp_servers.json",
+    "*/.claude/projects/*/memory/*.md",
+    "*/.claude/plugins/cache/**/*.md",
+    "*/.claude/mcp-servers/**/*.py",
+]
+
+bash_globs = [
+    # Git — output is SHAs, refs, commit messages, diffs. Never secrets.
+    "*git log*",
+    "*git status*",
+    "*git diff*",
+    "*git branch*",
+    "*git checkout*",
+    "*git fetch*",
+    "*git remote*",
+    "*git show*",
+    "*git tag*",
+    "*git stash*",
+    "*git ls-tree*",
+    "*git add*",
+    "*git commit*",
+    # GitHub CLI — GraphQL node IDs (PVTI_, PVT_, R_kw*, I_kw*) are internal
+    # GitHub object identifiers, not secrets.
+    "*gh pr*",
+    "*gh issue*",
+    "*gh run*",
+    "*gh project*",
+    "*gh api graphql*",
+    "*gh repo list*",
+    # Package managers — test UUIDs pass Luhn check (FP credit card); pip
+    # PATH warnings contain base64-like directory hashes.
+    "*npm run*",
+    "*npm test*",
+    "*pnpm*",
+    "*pip install*",
+    "*pip3 install*",
 ]
