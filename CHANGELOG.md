@@ -5,6 +5,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.7.0] — 2026-04-12
+
+### Changed
+
+- **Removed PostToolUse hook** — `PostToolUse` fired after Claude already received tool output (Read/Bash/NotebookEdit), making content-scanning after-the-fact. With the proxy scanning at the wire level before any payload reaches Anthropic, PostToolUse was redundant and produced false-positive noise. `SessionStart`, `UserPromptSubmit`, and `PreToolUse` hooks are unchanged.
+
+- **Generic Claude Code FP suppressions now ship by default** — git commands, GitHub CLI output, and package manager (npm/pnpm/pip) output trigger entropy/Luhn false positives on every project. Six Claude Code tooling paths (settings.json, .mcp.json, project memory, plugin cache) trigger entropy FPs. These are now in the default `rules/allowlist.toml` so new installs work cleanly without manual allowlist entries.
+
+---
+
 ## [0.3.0] — 2026-04-10
 
 This release replaces every hard-block with an interactive action picker

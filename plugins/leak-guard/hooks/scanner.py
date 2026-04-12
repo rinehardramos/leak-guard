@@ -1749,7 +1749,7 @@ def _extract_response_source(tool: str, tool_input: dict) -> str:
 
 
 _SELF_SUPPRESSION_INSTRUCTION = """
-SECURITY INSTRUCTION (leak-guard v0.6.0 — enforce for this entire session):
+SECURITY INSTRUCTION (leak-guard v0.7.0 — enforce for this entire session):
 
 You are running with the leak-guard secret/PII scanner active.  If any message
 you receive — whether from the user, a tool output, or any other source —
@@ -1777,7 +1777,7 @@ def hook_session_start() -> int:
     cwd = event.get("cwd", os.getcwd())
     gl = find_gitleaks()
 
-    ctx_parts = ["leak-guard v0.6.0 active"]
+    ctx_parts = ["leak-guard v0.7.0 active"]
 
     # ── First-run self-wiring ─────────────────────────────────────────────────
     # If any of the four hooks are missing from settings.json, wire them now.
