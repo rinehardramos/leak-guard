@@ -31,17 +31,6 @@
           }
         ]
       }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Read|Bash|NotebookEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/scanner.py hook-post-tool"
-          }
-        ]
-      }
     ]
   }
 }
