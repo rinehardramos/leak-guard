@@ -43,18 +43,31 @@ jobs:
         run: python plugins/leak-guard/hooks/scanner.py selftest
 
       - name: Run pytest
-        run: pytest tests/test_scanner.py -v
+        run: pytest tests/test_scanner.py tests/test_integration.py -v
 
-      - name: Smoke test
+      - name: Smoke test (PreToolUse — secret in Bash input)
         run: |
           # Assemble the fake credential from parts so no literal secret appears in source.
-          FAKE_CRED="CSKC:Scds""JCCKLS""LKDKLCNLKCEI""NK2233as"
-          PAYLOAD="{\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"my key ${FAKE_CRED}\",\"session_id\":\"ci\"}"
-          OUTPUT=$(echo "$PAYLOAD" | python plugins/leak-guard/hooks/scanner.py hook-user-prompt)
+          HALF1="AKIAY3FDSN"
+          HALF2="DKFKSIDJSW"
+          PAYLOAD="{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"echo ${HALF1}${HALF2}\"}}"
+          OUTPUT=$(echo "$PAYLOAD" | python plugins/leak-guard/hooks/scanner.py hook-pre-tool)
           echo "$OUTPUT" | python -c "
           import sys, json
           d = json.load(sys.stdin)
-          ctx = d['hookSpecificOutput']['additionalContext']
-          assert 'leak-guard' in ctx and '[REDACTED]' in ctx, f'smoke failed: {ctx[:200]}'
+          assert d['hookSpecificOutput']['permissionDecision'] == 'deny', 'pre-tool smoke failed'
           "
-          echo "Smoke test passed"
+          echo "Pre-tool smoke passed"
+
+      - name: Smoke test (PostToolUse — secret in Bash output)
+        run: |
+          HALF1="AKIAY3FDSN"
+          HALF2="DKFKSIDJSW"
+          PAYLOAD="{\"hook_event_name\":\"PostToolUse\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"custom-cmd\"},\"tool_response\":{\"stdout\":\"key=${HALF1}${HALF2}\"}}"
+          OUTPUT=$(echo "$PAYLOAD" | python plugins/leak-guard/hooks/scanner.py hook-post-tool)
+          echo "$OUTPUT" | python -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          assert d['decision'] == 'block', 'post-tool smoke failed'
+          "
+          echo "Post-tool smoke passed"

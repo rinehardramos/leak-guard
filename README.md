@@ -2,7 +2,7 @@
 
 > Local-first PII & secret scanner for Claude Code. Redacts leaks before they reach the model.
 
-[![Version](https://img.shields.io/badge/version-0.5.0-blue)](https://github.com/rinehardramos/leak-guard)
+[![Version](https://img.shields.io/badge/version-0.7.0-blue)](https://github.com/rinehardramos/leak-guard)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Claude Code Plugin](https://img.shields.io/badge/Claude%20Code-plugin-orange)](https://claude.ai/settings/plugins)
 
@@ -14,10 +14,6 @@
 
 ![scan-leaks demo](demo/scan-leaks.gif)
 
-**Hook protocol** — secret redacted in prompt, Claude reports what was caught:
-
-![hook block demo](demo/hook-block.gif)
-
 **Selftest** — 22 internal checks passing:
 
 ![selftest demo](demo/selftest.gif)
@@ -26,44 +22,49 @@
 
 ## What it does
 
-Every time you submit a prompt, Claude reads a file, or runs a command — leak-guard scans the content locally for secrets and PII. If something is found, the prompt is **blocked before reaching Anthropic** (exit 2). You see a highlighted preview in your terminal showing exactly what was flagged, then choose:
+A local HTTP proxy sits between Claude Code and the Anthropic API. Every outbound `/v1/messages` request is scanned for secrets and PII **before it leaves your machine**. If something is found, the raw value is replaced with a semantic `[REDACTED:{type}]` tag and a system note asks you to choose:
 
-- **Enter** — redact with semantic `[REDACTED:{type}]` tags and send
-- **a** — allow these values (adds to local allowlist) and send original
+- **allow** — add the value to your local allowlist and resend the original
+- **redact** — keep the redacted version
 
-Raw sensitive values never leave your machine unless you explicitly allow them.
+Pre-tool hooks provide a second layer: they block Bash/Write/Edit commands that contain secrets in their input, and prevent reads of sensitive files (`.env`, `id_rsa`, etc.).
 
-To bypass all findings for a single submission, prefix your prompt with `[allow-once]`.
+Raw sensitive values never reach Anthropic unless you explicitly allow them. All scanning runs 100% locally.
 
 ---
 
 ## How it works
 
 ```
-User prompt submitted
+Claude Code sends /v1/messages request
         |
         v
-UserPromptSubmit hook fires (before Claude sees it)
+ANTHROPIC_BASE_URL routes to local proxy (127.0.0.1:18019)
         |
         v
-scanner.py scans prompt text
+proxy.py extracts user text, runs scanner
         |
     findings?
    /         \
  yes           no
   |             |
-Exit 2 (BLOCK)  Pass through unchanged
-Show >>>highlighted<<< preview in terminal
-        |
-  User replies:
-  Enter = redact with [REDACTED:{type}] tags
-  a     = allow + persist to allowlist
+  |          Forward unchanged to api.anthropic.com
+  |
+Replace raw values with [REDACTED:{type}] tags
+Inject system note: "leak-guard found N items. Reply allow/redact."
+Save findings to pending.json (5-min TTL)
+Forward redacted payload to api.anthropic.com
         |
         v
-Claude responds with redacted or original prompt
+User replies "allow" or "redact"
+        |
+        v
+proxy.py reads pending, applies choice:
+  allow  = add to ~/.claude/leak-guard/allowlist.toml, confirm
+  redact = clear pending, confirm
 ```
 
-All scanning runs 100% locally. No data is sent to any external service.
+Pre-tool hooks run in parallel — they block tool input containing secrets before execution, and prevent reads of sensitive files by filename pattern.
 
 ---
 
@@ -85,14 +86,26 @@ gitleaks is optional — leak-guard warns if it is absent but does not fail. If 
 
 ---
 
-## Hook coverage
+## Enforcement layers
+
+leak-guard uses a **two-layer model**: a local proxy for wire-level interception and Claude Code hooks for tool-level guarding.
+
+### Proxy (primary — wire-level)
+
+| What | How |
+|---|---|
+| User prompts | Scans `/v1/messages` bodies; redacts findings with `[REDACTED:{type}]` tags before forwarding |
+| Token counting | Silently redacts `/v1/messages/count_tokens` bodies (no user prompt) |
+| Allow/redact flow | Detects user choice in next turn; persists allowed values to allowlist |
+| Post-tool output | All API responses pass through the proxy — secrets in tool output never reach Anthropic |
+
+### Hooks (secondary — tool-level)
 
 | Hook | What it does |
 |---|---|
-| `UserPromptSubmit` | Scans user prompts; redacts findings before Claude sees them |
-| `PreToolUse` | Blocks Bash/Write/Edit calls that contain secrets in their input |
-| `PostToolUse` | Scans tool output (Bash stdout, file reads) for secrets/PII |
-| `SessionStart` | Scans for sensitive filenames in the working directory |
+| `PreToolUse` | Blocks Bash/Write/Edit calls that contain secrets in their input; blocks reads of sensitive filenames (`.env`, `id_rsa`, etc.) |
+| `SessionStart` | Auto-starts the proxy, wires hooks if missing, checks `ANTHROPIC_BASE_URL` config |
+| `UserPromptSubmit` | Pass-through (NER instruction for long text only) — prompt scanning is handled by the proxy |
 
 ---
 
@@ -106,20 +119,23 @@ gitleaks is optional — leak-guard warns if it is absent but does not fail. If 
 claude plugin install leak-guard@leak-guard
 ```
 
-### 2. Wire the hooks (one-time setup)
+### 2. Wire hooks and proxy (one-time setup)
 
 ```bash
-python3 ~/.claude/plugins/cache/leak-guard/leak-guard/0.3.0/hooks/scanner.py install
+python3 ~/.claude/plugins/cache/leak-guard/leak-guard/*/hooks/scanner.py install
 ```
+
+> **Tip:** The glob `*` matches whatever version was installed — no need to know the exact version number.
 
 This single command:
 - Syncs the plugin source into the Claude Code cache
 - Runs the selftest suite to verify your environment
-- Writes all four Claude Code hooks (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `SessionStart`) into `~/.claude/settings.json` — idempotently, no duplicates
+- Writes three Claude Code hooks (`UserPromptSubmit`, `PreToolUse`, `SessionStart`) into `~/.claude/settings.json` — idempotently, no duplicates
+- Sets `ANTHROPIC_BASE_URL` in your shell profile so the local proxy can intercept and scan API traffic (post-tool output scanning)
 
 ### 3. Restart Claude Code
 
-Hook changes take effect on the next session start.
+Hook and proxy changes take effect on the next session start. The proxy starts automatically via the `SessionStart` hook.
 
 ---
 
@@ -190,6 +206,17 @@ python3 plugins/leak-guard/hooks/scanner.py flag fp --suppress-rule <rule_id>
 python3 plugins/leak-guard/hooks/scanner.py flag fn --rule-id <id> --pattern <regex>
 ```
 
+### Proxy management
+
+```bash
+# Start/stop/check the local proxy (auto-started by SessionStart hook)
+python3 plugins/leak-guard/hooks/scanner.py proxy-start
+python3 plugins/leak-guard/hooks/scanner.py proxy-stop
+python3 plugins/leak-guard/hooks/scanner.py proxy-status
+```
+
+The proxy requires `ANTHROPIC_BASE_URL=http://127.0.0.1:18019` in your shell profile (set automatically by `install`). It shuts down after 4 hours of inactivity and restarts on the next Claude Code session.
+
 ### LLM verifier (opt-in)
 
 ```bash
@@ -226,7 +253,10 @@ leak-guard/
     ├── .claude-plugin/plugin.json       <- plugin manifest
     ├── hooks/
     │   ├── hooks.json                   <- hook registrations
-    │   └── scanner.py                   <- detector engine (stdlib only)
+    │   ├── scanner.py                   <- detector engine + CLI (stdlib only)
+    │   └── proxy.py                     <- local HTTP proxy (primary enforcement)
+    ├── git-hooks/
+    │   └── pre-push                     <- git pre-push hook template
     ├── skills/scan-leaks/SKILL.md       <- /scan-leaks command
     ├── rules/
     │   ├── pii.toml                     <- PII regex pack
@@ -235,7 +265,7 @@ leak-guard/
     └── tests/                           <- pytest suite
 ```
 
-`scanner.py` is stdlib-only Python. The only optional external binary is `gitleaks`. If gitleaks is absent, leak-guard warns but continues. If the scanner crashes, events are blocked (fail-closed).
+`scanner.py` and `proxy.py` are stdlib-only Python. The only optional external binary is `gitleaks`. If gitleaks is absent, leak-guard warns but continues. If the scanner crashes, hooks are fail-closed. The proxy auto-starts via the `SessionStart` hook and listens on `127.0.0.1:18019` (configurable via `LEAK_GUARD_PROXY_PORT`).
 
 ---
 
@@ -247,8 +277,11 @@ cd ~/Projects/leak-guard
 # Internal smoke tests (22 checks)
 python3 plugins/leak-guard/hooks/scanner.py selftest
 
-# Full test suite
+# Full test suite (unit + integration + proxy)
 pytest tests/ -v
+
+# Docker clean-room matrix (Python 3.9/3.12 x gitleaks x amd64/arm64)
+bash tests/docker/run_matrix.sh
 ```
 
 ---
@@ -260,6 +293,17 @@ MIT — see [LICENSE](LICENSE).
 ---
 
 ## Changelog
+
+### v0.7.0 (2026-04-13)
+- **PostToolUse hook removed** — superseded by proxy wire-level scanning; eliminates hook overhead on every tool call
+- **Default allowlist expanded** — promoted generic Claude Code FP suppressions (pytest, git, gh CLI, process listing, heredoc Python, binary analysis, CI workflows) from user allowlist to shipped defaults
+- **Self-referencing allowlist paths** — default allowlist now suppresses its own rule/fixture/scanner files, fixing the bootstrapping FP problem
+
+### v0.6.0 (2026-04-12)
+- **Proxy-based enforcement model** — local HTTP proxy intercepts API traffic to scan post-tool output at the wire level instead of relying on PostToolUse hooks
+- **Proxy lifecycle management** — PID tracking, daemon mode, watchdog, auto-start via SessionStart hook
+- **`ANTHROPIC_BASE_URL` wiring** — `install` command now sets the proxy env var in shell profile
+- **Simplified `UserPromptSubmit`** — hook is now a pass-through; block-and-preview UX moved to proxy layer
 
 ### v0.5.0 (2026-04-11)
 - **Privacy guarantee:** Raw sensitive values never reach Anthropic unless user explicitly allows

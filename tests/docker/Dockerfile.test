@@ -14,9 +14,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Optionally install gitleaks
+# Optionally install gitleaks (detect arch for ARM/x64 compatibility)
 RUN if [ "$INSTALL_GITLEAKS" = "true" ]; then \
-      wget -q https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz -O /tmp/gl.tgz \
+      ARCH=$(dpkg --print-architecture) && \
+      if [ "$ARCH" = "arm64" ] || [ "$ARCH" = "aarch64" ]; then \
+        GL_ARCH="arm64"; \
+      else \
+        GL_ARCH="x64"; \
+      fi && \
+      wget -q "https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_${GL_ARCH}.tar.gz" -O /tmp/gl.tgz \
       && tar -xzf /tmp/gl.tgz -C /usr/local/bin gitleaks \
       && chmod +x /usr/local/bin/gitleaks \
       && rm /tmp/gl.tgz; \
@@ -31,14 +37,31 @@ WORKDIR /leak-guard
 COPY plugins/ plugins/
 COPY tests/ tests/
 
-# The smoke payload is assembled at runtime from two halves so it is never
-# stored as a literal credential string in the image layer or source file.
+# Smoke tests:
+#   1. selftest — internal checks (Python, rules, gitleaks, hooks)
+#   2. pytest — unit + integration test suite
+#   3. pre-tool smoke — Bash input with fake AWS key is denied
+#   4. post-tool smoke — Bash output with fake AWS key is blocked
+#   5. filename smoke — Read of .env is denied
+#
+# Credentials assembled at runtime from halves to avoid literal patterns in layers.
 CMD ["bash", "-c", \
      "echo '=== selftest ===' && python3 plugins/leak-guard/hooks/scanner.py selftest && \
-      echo '=== pytest ===' && pytest tests/test_scanner.py -v && \
-      echo '=== smoke ===' && \
-      HALF1='CSKC:Scds' && HALF2='JCCKL-SLKDKLCNLKCEIN-K2233as' && \
-      PAYLOAD=\"{\\\"hook_event_name\\\":\\\"UserPromptSubmit\\\",\\\"prompt\\\":\\\"key ${HALF1}${HALF2}\\\",\\\"session_id\\\":\\\"docker\\\"}\" && \
-      OUTPUT=$(echo \"$PAYLOAD\" | python3 plugins/leak-guard/hooks/scanner.py hook-user-prompt) && \
-      echo \"$OUTPUT\" | python3 -c \"import sys,json; d=json.load(sys.stdin); ctx=d['hookSpecificOutput']['additionalContext']; assert 'leak-guard' in ctx and '[REDACTED]' in ctx, f'smoke failed: {ctx[:200]}'\" && \
+      echo '=== pytest ===' && pytest tests/test_scanner.py tests/test_integration.py -v && \
+      echo '=== pre-tool smoke ===' && \
+      HALF1='AKIAY3FDSN' && HALF2='DKFKSIDJSW' && \
+      PAYLOAD=\"{\\\"hook_event_name\\\":\\\"PreToolUse\\\",\\\"tool_name\\\":\\\"Bash\\\",\\\"tool_input\\\":{\\\"command\\\":\\\"echo ${HALF1}${HALF2}\\\"}}\" && \
+      OUTPUT=$(echo \"$PAYLOAD\" | python3 plugins/leak-guard/hooks/scanner.py hook-pre-tool) && \
+      echo \"$OUTPUT\" | python3 -c \"import sys,json; d=json.load(sys.stdin); assert d['hookSpecificOutput']['permissionDecision']=='deny', 'pre-tool smoke failed'\" && \
+      echo 'pre-tool smoke OK' && \
+      echo '=== post-tool smoke ===' && \
+      PAYLOAD2=\"{\\\"hook_event_name\\\":\\\"PostToolUse\\\",\\\"tool_name\\\":\\\"Bash\\\",\\\"tool_input\\\":{\\\"command\\\":\\\"custom-cmd\\\"},\\\"tool_response\\\":{\\\"stdout\\\":\\\"key=${HALF1}${HALF2}\\\"}}\" && \
+      OUTPUT2=$(echo \"$PAYLOAD2\" | python3 plugins/leak-guard/hooks/scanner.py hook-post-tool) && \
+      echo \"$OUTPUT2\" | python3 -c \"import sys,json; d=json.load(sys.stdin); assert d['decision']=='block', 'post-tool smoke failed'\" && \
+      echo 'post-tool smoke OK' && \
+      echo '=== filename smoke ===' && \
+      PAYLOAD3=\"{\\\"hook_event_name\\\":\\\"PreToolUse\\\",\\\"tool_name\\\":\\\"Read\\\",\\\"tool_input\\\":{\\\"file_path\\\":\\\"/home/user/.env\\\"}}\" && \
+      OUTPUT3=$(echo \"$PAYLOAD3\" | python3 plugins/leak-guard/hooks/scanner.py hook-pre-tool) && \
+      echo \"$OUTPUT3\" | python3 -c \"import sys,json; d=json.load(sys.stdin); assert d['hookSpecificOutput']['permissionDecision']=='deny', 'filename smoke failed'\" && \
+      echo 'filename smoke OK' && \
       echo 'All checks passed'"]
