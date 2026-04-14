@@ -39,6 +39,23 @@ path_globs = [
     "*/.git/*",
     "*/dist/*",
     "*/build/*",
+    # leak-guard's own config/rule files — allowlist entries contain example
+    # emails and high-entropy strings by design. Without this self-reference
+    # the scanner blocks its own allowlist (bootstrapping problem).
+    "*/leak-guard/plugins/leak-guard/rules/*.toml",
+    "*/leak-guard/plugins/leak-guard/hooks/*.json",
+    "*/leak-guard/plugins/leak-guard/hooks/scanner.py",
+    "*/leak-guard/plugins/leak-guard/proxy.py",
+    "*/leak-guard/plugins/leak-guard/.claude-plugin/*.json",
+    "*/leak-guard/.claude-plugin/*.json",
+    "*/leak-guard/tests/fixtures/*.toml",
+    "*/leak-guard/tests/fixtures/*.py",
+    "*/leak-guard/allowlist.toml",
+    "*/leak-guard/README.md",
+    "*/leak-guard/CHANGELOG.md",
+    "*/plugins/cache/leak-guard/*/hooks/scanner.py",
+    "*/plugins/cache/leak-guard/*/rules/*.toml",
+    "*/.claude-plugin/plugin.json",
     # Claude Code tooling — plugin node IDs, MCP configs, project memory,
     # and skill cache all trigger entropy/email false positives.
     "*/.claude/settings.json",
@@ -47,6 +64,8 @@ path_globs = [
     "*/.claude/projects/*/memory/*.md",
     "*/.claude/plugins/cache/**/*.md",
     "*/.claude/mcp-servers/**/*.py",
+    # CI workflow files — contain environment variable references, not secrets.
+    "*/.github/workflows/*.yml",
 ]
 
 bash_globs = [
@@ -64,6 +83,7 @@ bash_globs = [
     "*git ls-tree*",
     "*git add*",
     "*git commit*",
+    "*git -C*",
     # GitHub CLI — GraphQL node IDs (PVTI_, PVT_, R_kw*, I_kw*) are internal
     # GitHub object identifiers, not secrets.
     "*gh pr*",
@@ -79,4 +99,30 @@ bash_globs = [
     "*pnpm*",
     "*pip install*",
     "*pip3 install*",
+    "*uv run*pytest*",
+    # leak-guard CLI — output is file paths and status messages, not secrets.
+    "*scanner.py selftest*",
+    "*scanner.py install*",
+    "*scanner.py hook-settings*",
+    # Test runners — pytest output contains node IDs, UUIDs, and module paths
+    # that trigger entropy and Luhn false positives.
+    "*pytest*",
+    "*-m pytest*",
+    # Process listing — PIDs and process names, never secrets.
+    "*ps aux*",
+    "*ps*grep*",
+    # Heredoc Python — macOS temp paths (/var/folders/...) trigger entropy FP.
+    "*python3 - <<*",
+    "*python3 -*EOF*",
+    # Reading Claude Code config — contains plugin node IDs, not secrets.
+    "*cat*/.claude/settings.json*",
+    "*settings.json*json.tool*",
+    "*cat*/.github/workflows*",
+    # Binary analysis tools — output is mangled identifiers, not secrets.
+    "*strings*",
+    # Agent task output files — contain session UUIDs and message IDs.
+    "*tail*tasks/*.output*",
+    "*wc*tasks/*.output*",
+    "*grep*tasks/*.output*",
+    "*cat*tasks/*.output*",
 ]

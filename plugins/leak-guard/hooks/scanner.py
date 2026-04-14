@@ -271,10 +271,36 @@ def load_filename_blocklist() -> list[str]:
     return result
 
 
+def _find_source_tree_allowlist() -> "Path | None":
+    """If running from a cache dir, locate the source-tree allowlist via breadcrumb."""
+    if ".claude/plugins/cache" not in str(PLUGIN_ROOT):
+        return None
+    breadcrumb = PLUGIN_ROOT / ".source_root"
+    if breadcrumb.exists():
+        try:
+            src_root = Path(breadcrumb.read_text(encoding="utf-8").strip())
+            candidate = src_root / "rules" / "allowlist.toml"
+            if candidate.exists():
+                return candidate
+        except OSError:
+            pass
+    # Fallback: env var
+    src_env = os.environ.get("LEAK_GUARD_SOURCE_ROOT")
+    if src_env:
+        candidate = Path(src_env) / "plugins" / "leak-guard" / "rules" / "allowlist.toml"
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def _allowlist_mtime() -> float:
-    """Combined mtime of both allowlist files — changes when either file is edited."""
+    """Combined mtime of all allowlist sources — changes when any is edited."""
     total = 0.0
-    for src in (RULES_DIR / "allowlist.toml", USER_ALLOWLIST):
+    sources: list[Path] = [RULES_DIR / "allowlist.toml", USER_ALLOWLIST]
+    src_tree = _find_source_tree_allowlist()
+    if src_tree and src_tree not in sources:
+        sources.append(src_tree)
+    for src in sources:
         try:
             total += src.stat().st_mtime
         except OSError:
@@ -292,6 +318,18 @@ def load_allowlist() -> Allowlist:
 
     allow = Allowlist()
     default = RULES_DIR / "allowlist.toml"
+
+    # If running from cache, prefer a fresher source-tree copy of the default
+    src_tree = _find_source_tree_allowlist()
+    if src_tree and src_tree != default:
+        try:
+            src_mtime = src_tree.stat().st_mtime
+            def_mtime = default.stat().st_mtime if default.exists() else 0.0
+            if src_mtime > def_mtime:
+                default = src_tree
+        except OSError:
+            pass
+
     for src in (default, USER_ALLOWLIST):
         if not src.exists():
             continue
@@ -933,14 +971,20 @@ def scan_secrets_gitleaks(text: str | None = None, path: str | None = None,
             if p.is_file():
                 # Pipe file content — avoids scanning siblings in the parent dir.
                 file_text = p.read_text(errors="replace")
+                report_f = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+                report_f.close()
+                report_path = Path(report_f.name)
                 cmd = [
                     gl, "detect", "--pipe",
-                    "--report-format", "json", "--report-path", "-",
+                    "--report-format", "json", "--report-path", str(report_path),
                     "--exit-code", "0", "--no-banner",
                 ]
                 result = subprocess.run(cmd, input=file_text, capture_output=True,
                                         text=True, timeout=30)
-                raw_json = result.stdout or "[]"
+                try:
+                    raw_json = report_path.read_text() if report_path.exists() else "[]"
+                finally:
+                    report_path.unlink(missing_ok=True)
             elif p.is_dir():
                 report_f = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
                 report_f.close()
@@ -959,15 +1003,23 @@ def scan_secrets_gitleaks(text: str | None = None, path: str | None = None,
             else:
                 return []  # path doesn't exist yet; nothing to scan
         else:
-            # In-memory text: pipe via stdin (most reliable across gitleaks versions)
+            # In-memory text: pipe via stdin.
+            # Use a temp file for the report — --report-path - (stdout) is
+            # broken in some gitleaks versions (e.g. v8.21.x on Linux ARM).
+            report_f = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+            report_f.close()
+            report_path = Path(report_f.name)
             cmd = [
                 gl, "detect", "--pipe",
-                "--report-format", "json", "--report-path", "-",
+                "--report-format", "json", "--report-path", str(report_path),
                 "--exit-code", "0", "--no-banner",
             ]
             result = subprocess.run(cmd, input=text or "", capture_output=True,
                                     text=True, timeout=30)
-            raw_json = result.stdout or "[]"
+            try:
+                raw_json = report_path.read_text() if report_path.exists() else "[]"
+            finally:
+                report_path.unlink(missing_ok=True)
 
         findings: list[Finding] = []
         try:
@@ -1786,7 +1838,7 @@ def hook_session_start() -> int:
     try:
         _settings_path = Path.home() / ".claude" / "settings.json"
         _me = str(Path(__file__).resolve())
-        _needed = {"hook-user-prompt", "hook-pre-tool", "hook-post-tool", "hook-session-start"}
+        _needed = {"hook-user-prompt", "hook-pre-tool", "hook-session-start"}
         _wired: set[str] = set()
         if _settings_path.exists():
             import json as _json_sw
@@ -1805,6 +1857,22 @@ def hook_session_start() -> int:
                     "⚙ leak-guard: hooks auto-wired into ~/.claude/settings.json "
                     "(first-run setup). Please restart Claude Code to activate them."
                 )
+        elif _wired:
+            # All hooks present — check if any point to a stale path.
+            _expected = str(Path(__file__).resolve())
+            _stale = any(
+                _sub in _h.get("command", "") and _expected not in _h.get("command", "")
+                for _ev_entries in _sw_data.get("hooks", {}).values()
+                for _ev_entry in _ev_entries
+                for _h in _ev_entry.get("hooks", [])
+                for _sub in _needed
+            )
+            if _stale:
+                _rc = cmd_hook_settings(settings_path=_settings_path, scanner_path=_me)
+                if _rc == 0:
+                    ctx_parts.append(
+                        "leak-guard: updated stale hook paths. Restart to activate."
+                    )
     except Exception:
         pass  # never block a session on setup failure
 
@@ -2027,6 +2095,12 @@ def cmd_install_plugin() -> int:
         except OSError as exc:
             errors.append(f"  {rel}: {exc}")
 
+    # ── Write source-root breadcrumb so cached copies can find the source tree
+    try:
+        (cache_root / ".source_root").write_text(str(src_root), encoding="utf-8")
+    except OSError:
+        pass  # non-fatal
+
     # ── Report ───────────────────────────────────────────────────────────────
     print(f"leak-guard: installed {copied} file(s) → {cache_root}")
     if skipped:
@@ -2125,18 +2199,20 @@ def cmd_hook_settings(
 
     hooks = data.setdefault("hooks", {})
 
-    # ── Helper: add one hook entry idempotently ───────────────────────────
+    # ── Helper: add or update one hook entry ────────────────────────────
     def _add_hook(event: str, entry: dict, dedup_key: str) -> None:
-        """Append entry to hooks[event] unless a leak-guard entry already exists.
+        """Add or update a leak-guard hook entry in hooks[event].
 
         dedup_key: substring that uniquely identifies this hook's command.
+        If an existing entry matches, its command is updated in-place.
         """
         bucket = hooks.setdefault(event, [])
-        # Check for existing leak-guard entry by scanning all commands
+        new_cmd = entry["hooks"][0]["command"]
         for existing_entry in bucket:
             for h in existing_entry.get("hooks", []):
                 if dedup_key in h.get("command", ""):
-                    return  # already present — skip
+                    h["command"] = new_cmd
+                    return  # updated in-place
         bucket.append(entry)
 
     # ── UserPromptSubmit ──────────────────────────────────────────────────
@@ -2168,19 +2244,15 @@ def cmd_hook_settings(
         dedup_key="hook-pre-tool",
     )
 
-    # ── PostToolUse ───────────────────────────────────────────────────────
-    _add_hook(
-        "PostToolUse",
-        {
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": f"{python} {scanner_path} hook-post-tool",
-                }
-            ]
-        },
-        dedup_key="hook-post-tool",
-    )
+    # ── Clean up deprecated PostToolUse hook (removed in v0.7.0) ────────
+    if "PostToolUse" in hooks:
+        hooks["PostToolUse"] = [
+            e for e in hooks["PostToolUse"]
+            if not any("hook-post-tool" in h.get("command", "")
+                       for h in e.get("hooks", []))
+        ]
+        if not hooks["PostToolUse"]:
+            del hooks["PostToolUse"]
 
     # ── SessionStart (matcher=startup) ────────────────────────────────────
     _add_hook(
@@ -2208,8 +2280,8 @@ def cmd_hook_settings(
         print(f"leak-guard: could not write {settings_path}: {exc}", file=sys.stderr)
         return 2
 
-    print(f"leak-guard: hooks wired in {settings_path}")
-    print("  Restart Claude Code for changes to take effect.")
+    print(f"leak-guard: hooks wired in {settings_path}", file=sys.stderr)
+    print("  Restart Claude Code for changes to take effect.", file=sys.stderr)
     return 0
 
 
@@ -2455,7 +2527,6 @@ def cmd_selftest() -> int:
             for event, subcmd in [
                 ("UserPromptSubmit", "hook-user-prompt"),
                 ("PreToolUse", "hook-pre-tool"),
-                ("PostToolUse", "hook-post-tool"),
                 ("SessionStart", "hook-session-start"),
             ]:
                 entries = hooks.get(event, [])
