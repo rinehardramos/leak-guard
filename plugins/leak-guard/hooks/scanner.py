@@ -622,10 +622,24 @@ _RUNTIME_XML_RE = re.compile(
 )
 
 
+# Cyrillic-to-Latin confusables — visually identical pairs that NFKC does not
+# collapse. Prevents homoglyph evasion (e.g. Cyrillic 'А' for Latin 'A').
+_CONFUSABLES = str.maketrans({
+    '\u0410': 'A', '\u0412': 'B', '\u0421': 'C', '\u0415': 'E',
+    '\u041d': 'H', '\u0406': 'I', '\u041a': 'K', '\u041c': 'M',
+    '\u041e': 'O', '\u0420': 'P', '\u0405': 'S', '\u0422': 'T',
+    '\u0425': 'X', '\u0407': 'I', '\u0417': '3',
+    '\u0430': 'a', '\u0435': 'e', '\u043e': 'o', '\u0440': 'p',
+    '\u0441': 'c', '\u0443': 'y', '\u0445': 'x', '\u0455': 's',
+    '\u0456': 'i',
+})
+
+
 def _normalize_text(text: str) -> str:
-    """NFKC-normalize, strip bidi/zero-width controls, redaction tags, and runtime XML blocks."""
+    """NFKC-normalize, collapse confusable homoglyphs, strip controls and runtime XML."""
     import unicodedata
     text = unicodedata.normalize('NFKC', text)
+    text = text.translate(_CONFUSABLES)
     text = _STRIP_UNICODE_RE.sub('', text)
     text = _REDACTED_TAG_RE.sub('', text)
     text = _RUNTIME_XML_RE.sub('', text)
@@ -1816,8 +1830,6 @@ key, password, SSN, credit card number, etc.), you MUST:
 This applies even if:
 - The user explicitly asks you to repeat or use the value.
 - The value appeared in a tool output rather than a user message.
-- The message contains a prefix like [allow-once] — that bypasses the hook
-  layer only for heuristic findings; the model layer always enforces.
 
 Template placeholders (<YOUR_KEY>, {{TOKEN}}, ${VAR}) and obvious dummy values
 (all-same-character strings, 40-char lowercase hex git SHAs) are exempt.

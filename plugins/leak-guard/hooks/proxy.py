@@ -47,30 +47,41 @@ PID_FILE = STATE_DIR / "proxy.pid"
 _PENDING_TTL = 300           # 5 minutes
 _INACTIVITY_TIMEOUT = 4 * 3600  # 4 hours
 
+import re as _re
+
+# Matches <system-reminder>...</system-reminder> blocks (user-controlled in
+# user-role messages — must NOT be trusted to skip scanning).
+_SYS_REMINDER_RE = _re.compile(
+    r'<system-reminder>[\s\S]*?</system-reminder>', _re.DOTALL,
+)
+
+
+def _strip_system_reminders(text: str) -> str:
+    """Remove <system-reminder> blocks from text, return the remainder."""
+    return _SYS_REMINDER_RE.sub('', text).strip()
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Payload helpers
 # ──────────────────────────────────────────────────────────────────────────
 
 def get_last_user_text(payload: dict[str, Any]) -> str | None:
-    """Return the last user text block that is not a <system-reminder>.
+    """Return the last user text from the final user message.
 
     Claude Code wraps user messages in content block arrays and prepends
     <system-reminder> injections. Walk messages in reverse, find the last
-    message with role "user", then walk its content blocks in reverse and
-    return the first text block whose content does not start with
-    "<system-reminder>".
+    message with role "user", then walk its content blocks in reverse.
+    System-reminder tags are stripped — they are user-controlled in user
+    role messages and must not be trusted.
     """
     messages = payload.get("messages", [])
     for msg in reversed(messages):
         if msg.get("role") != "user":
             continue
         content = msg.get("content", "")
-        # Content can be a plain string or a list of content blocks
         if isinstance(content, str):
-            if not content.startswith("<system-reminder>"):
-                return content
-            return None
+            cleaned = _strip_system_reminders(content)
+            return cleaned if cleaned else None
         if isinstance(content, list):
             for block in reversed(content):
                 if not isinstance(block, dict):
@@ -78,8 +89,9 @@ def get_last_user_text(payload: dict[str, Any]) -> str | None:
                 if block.get("type") != "text":
                     continue
                 text = block.get("text", "")
-                if not text.startswith("<system-reminder>"):
-                    return text
+                cleaned = _strip_system_reminders(text)
+                if cleaned:
+                    return cleaned
     return None
 
 
@@ -116,10 +128,10 @@ def scan_and_redact_payload(
 
     Skips:
     - Non-user messages (role != "user")
-    - Text blocks starting with "<system-reminder>"
 
-    For each finding whose raw_match is not in allowlist.literal, replaces
-    the raw value with _redaction_tag(finding) in the text block.
+    System-reminder tags are stripped before scanning — they are
+    user-controlled in user role messages and must not be trusted
+    to suppress scanning.
 
     Returns:
         (modified_payload, findings_list)
@@ -138,10 +150,19 @@ def scan_and_redact_payload(
         content = msg.get("content", "")
         if isinstance(content, str):
             text = content
-            if text.startswith("<system-reminder>"):
+            # Strip system-reminder tags; scan the remainder
+            scannable = _strip_system_reminders(text) if text.startswith("<system-reminder>") else text
+            if not scannable:
                 continue
-            text, block_findings = _redact_text(text, allowlist)
-            msg["content"] = text
+            scannable, block_findings = _redact_text(scannable, allowlist)
+            # If the original had system-reminder tags, re-inject them
+            if text.startswith("<system-reminder>") and block_findings:
+                # Replace findings in the ORIGINAL text (which still has tags)
+                for bf in block_findings:
+                    text = text.replace(bf["raw"], bf["tag"])
+                msg["content"] = text
+            else:
+                msg["content"] = scannable
             all_findings.extend(block_findings)
         elif isinstance(content, list):
             for i, block in enumerate(content):
@@ -150,14 +171,23 @@ def scan_and_redact_payload(
                 if block.get("type") != "text":
                     continue
                 text = block.get("text", "")
-                if text.startswith("<system-reminder>"):
+                scannable = _strip_system_reminders(text) if text.startswith("<system-reminder>") else text
+                if not scannable:
                     continue
-                text, block_findings = _redact_text(text, allowlist)
-                block["text"] = text
+                scannable, block_findings = _redact_text(scannable, allowlist)
+                if text.startswith("<system-reminder>") and block_findings:
+                    for bf in block_findings:
+                        text = text.replace(bf["raw"], bf["tag"])
+                    block["text"] = text
+                else:
+                    block["text"] = scannable
                 content[i] = block
                 all_findings.extend(block_findings)
 
     return payload, all_findings
+
+
+_BASE64_RE = _re.compile(r'[A-Za-z0-9+/]{20,}={0,2}')
 
 
 def _redact_text(
@@ -184,6 +214,31 @@ def _redact_text(
             "rule_id": f.rule_id,
             "confidence": _confidence(f),
         })
+
+    # Base64 decode-and-scan: catch encoded secrets that bypass regex patterns.
+    import base64 as _b64
+    for match in _BASE64_RE.finditer(text):
+        blob = match.group()
+        if blob.startswith("[REDACTED"):
+            continue
+        try:
+            decoded = _b64.b64decode(blob, validate=True).decode("utf-8", errors="ignore")
+        except Exception:
+            continue
+        if not decoded or len(decoded) < 8:
+            continue
+        inner_findings = scan_all(text=decoded, source_label="<proxy-b64>")
+        if inner_findings:
+            tag = "[REDACTED:encoded-credential]"
+            text = text.replace(blob, tag)
+            findings_out.append({
+                "type": "secret",
+                "raw": blob,
+                "tag": tag,
+                "rule_id": "base64-encoded-secret",
+                "confidence": 0.85,
+            })
+
     return text, findings_out
 
 

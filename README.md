@@ -39,7 +39,7 @@ Raw sensitive values never reach Anthropic unless you explicitly allow them. All
 Claude Code sends /v1/messages request
         |
         v
-ANTHROPIC_BASE_URL routes to local proxy (127.0.0.1:18019)
+ANTHROPIC_BASE_URL routes to local proxy
         |
         v
 proxy.py extracts user text, runs scanner
@@ -48,20 +48,19 @@ proxy.py extracts user text, runs scanner
    /         \
  yes           no
   |             |
-  |          Forward unchanged to api.anthropic.com
+  |          Forward unchanged to Anthropic API
   |
 Replace raw values with [REDACTED:{type}] tags
-Inject system note: "leak-guard found N items. Reply allow/redact."
-Save findings to pending.json (5-min TTL)
-Forward redacted payload to api.anthropic.com
+Inject system note asking user to allow or redact
+Forward redacted payload to Anthropic API
         |
         v
-User replies "allow" or "redact"
+User replies with choice
         |
         v
-proxy.py reads pending, applies choice:
-  allow  = add to ~/.claude/leak-guard/allowlist.toml, confirm
-  redact = clear pending, confirm
+proxy.py applies choice:
+  allow  = persist to local allowlist, confirm
+  redact = clear findings, confirm
 ```
 
 Pre-tool hooks run in parallel — they block tool input containing secrets before execution, and prevent reads of sensitive files by filename pattern.
@@ -215,7 +214,7 @@ python3 plugins/leak-guard/hooks/scanner.py proxy-stop
 python3 plugins/leak-guard/hooks/scanner.py proxy-status
 ```
 
-The proxy requires `ANTHROPIC_BASE_URL=http://127.0.0.1:18019` in your shell profile (set automatically by `install`). It shuts down after 4 hours of inactivity and restarts on the next Claude Code session.
+The proxy requires `ANTHROPIC_BASE_URL` to point to the local proxy (set automatically by `install`). It auto-restarts on each Claude Code session.
 
 ### LLM verifier (opt-in)
 
@@ -265,7 +264,7 @@ leak-guard/
     └── tests/                           <- pytest suite
 ```
 
-`scanner.py` and `proxy.py` are stdlib-only Python. The only optional external binary is `gitleaks`. If gitleaks is absent, leak-guard warns but continues. If the scanner crashes, hooks are fail-closed. The proxy auto-starts via the `SessionStart` hook and listens on `127.0.0.1:18019` (configurable via `LEAK_GUARD_PROXY_PORT`).
+`scanner.py` and `proxy.py` are stdlib-only Python. The only optional external binary is `gitleaks`. If gitleaks is absent, leak-guard warns but continues. If the scanner crashes, hooks are fail-closed. The proxy auto-starts via the `SessionStart` hook on a configurable local port.
 
 ---
 
@@ -326,7 +325,6 @@ MIT — see [LICENSE](LICENSE).
 ### v0.3.0 (2026-04-10)
 - Switched enforcement model: prompt values are redacted inline with `[REDACTED]`; Claude is notified via `additionalContext` SYSTEM NOTE rather than a hard block
 - Hook always exits 0 — no prompt suppression
-- `[allow-once]` prefix bypasses all findings for one submission
 - Expanded selftest to 22 checks (hook round-trip, training pipeline, gitleaks presence)
 - Added fuzzy credential detection (PREFIX:value patterns)
 - Added entropy analysis for base64/hex strings

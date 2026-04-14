@@ -48,7 +48,7 @@ Instead it:
 
 | Choice | Effect |
 |--------|--------|
-| **A** Allow once | Re-sends the original prompt as-is |
+| **A** Allow | Re-sends the original prompt as-is |
 | **R** Redact | Replaces each flagged token with `[REDACTED]`, sends cleaned prompt |
 | **D** Discard | Deletes pending file, blocks (exit 2) |
 | **F** Flag FP | Runs `flag fp --literal` for each target, then allows |
@@ -64,7 +64,7 @@ Example menu shown in Claude's UI:
   · fuzzy-prefixed-credential (high) — CSKC:Scds…[REDACTED]
 
   Your original message was withheld. Reply with your choice:
-    A — Allow once (send original prompt as-is)
+    A — Allow (send original prompt as-is)
     R — Redact (strip flagged content, send cleaned prompt)
     D — Discard (cancel, default after 5 min)
     F — Flag as false positive (allowlist + send)
@@ -99,9 +99,8 @@ the action picker and the user decides.
   by Claude Code as a silent notification (spinner with no text).  Fixed by
   exiting 0 with `updatedUserPrompt` = menu text so Claude renders it as a
   visible chat message.
-- **C02 preserved under new flow**: `[allow-once]` with a definitive secret
-  still shows the menu rather than auto-allowing.  The secret is never sent
-  to the model regardless of the prefix.
+- **C02 preserved under new flow**: definitive secrets always show the menu
+  regardless of user input.  The secret is never sent to the model.
 - **Allowlisted scanner state files**: `pending_action.json` and `audit.log`
   added to `path_globs` so the scanner doesn't flag its own state files.
 
@@ -120,14 +119,14 @@ Eight audit findings addressed:
 
 | ID  | Severity | Fix |
 |-----|----------|-----|
-| C02 | Critical | `[allow-once]` prefix now only bypasses heuristic findings. Definitive secrets (confirmed AWS keys, GitHub PATs, Stripe keys, etc.) block unconditionally even when the prefix is present. |
-| C01 | Critical | Git pre-push SHAs validated against `[0-9a-f]{40}` before being used in gitleaks `--log-opts`. Crafted push stdin could previously smuggle extra git-log flags. |
-| H02 | High | NFKC Unicode normalization + bidi/zero-width character stripping applied before all four scan functions. Closes homoglyph and zero-width evasion paths (adversarial tests H02, J10 now correctly handled). |
-| H05 | High | State directory created with `mode=0o700`; `audit.log` and config files with `0o600`. Existing installations upgraded on first run. Previously world-readable on default macOS umask. |
-| H03 | High | `sys.stdin.read()` capped at 4 MB in `read_event()`, `cmd_scan_text()`, and the git pre-push hook. Removes OOM/CPU DoS vector from large tool outputs. |
-| M04 | Medium | Malformed hook event JSON now fails closed (raises `ValueError` → outer handler emits block) instead of silently returning an empty dict and allowing. |
-| M06 | Medium | Internal exception details no longer emitted to Claude's context. Generic message shown; full `str(e)` written only to the local audit log. |
-| M07 | Medium | Removed credential-label words (`token`, `secret`, `apikey`, `api_key`, etc.) from `_KNOWN_DUMMY_VALUES`. These are labels, not placeholder values, and their presence was suppressing detection of any credential whose normalized value matched them. |
+| C02 | Critical | Definitive secrets (confirmed vendor keys) now block unconditionally regardless of user input prefix. |
+| C01 | Critical | Git pre-push SHA inputs validated against strict hex pattern before passing to gitleaks. |
+| H02 | High | NFKC Unicode normalization + bidi/zero-width character stripping applied before all scan functions. |
+| H05 | High | State directory and config files created with restrictive permissions (`0o700`/`0o600`). |
+| H03 | High | `sys.stdin.read()` capped at 4 MB across all entry points. |
+| M04 | Medium | Malformed hook event JSON now fails closed instead of allowing. |
+| M06 | Medium | Internal exception details no longer emitted to model context; written only to local audit log. |
+| M07 | Medium | Credential-label words removed from dummy-value suppression list to prevent false negatives. |
 
 ### Added
 
