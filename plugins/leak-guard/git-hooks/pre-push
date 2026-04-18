@@ -9,20 +9,19 @@ set -e
 
 # Locate scanner.py. Order:
 #   1. LEAK_GUARD_SCANNER env var
-#   2. Installed plugin cache (default CC plugin path)
-#   3. Development path
+#   2. Installed plugin cache (newest version via reverse-sorted glob)
+#   3. Development checkout
 SCANNER=""
 if [ -n "${LEAK_GUARD_SCANNER:-}" ] && [ -f "$LEAK_GUARD_SCANNER" ]; then
     SCANNER="$LEAK_GUARD_SCANNER"
-elif [ -f "$HOME/.claude/plugins/cache/leak-guard/leak-guard/0.1.0/hooks/scanner.py" ]; then
-    SCANNER="$HOME/.claude/plugins/cache/leak-guard/leak-guard/0.1.0/hooks/scanner.py"
-elif [ -f "$HOME/Projects/leak-guard/plugins/leak-guard/hooks/scanner.py" ]; then
-    SCANNER="$HOME/Projects/leak-guard/plugins/leak-guard/hooks/scanner.py"
 else
-    # Fallback: search the plugin cache for any version
-    CANDIDATE=$(find "$HOME/.claude/plugins/cache" -name "scanner.py" -path "*leak-guard*" 2>/dev/null | head -1)
-    if [ -n "$CANDIDATE" ]; then
+    # Pick the newest version directory in the plugin cache (sort -rV = reverse version sort)
+    CANDIDATE=$(find "$HOME/.claude/plugins/cache/leak-guard" -name "scanner.py" -path "*/hooks/scanner.py" 2>/dev/null \
+        | sort -rV | head -1)
+    if [ -n "$CANDIDATE" ] && [ -f "$CANDIDATE" ]; then
         SCANNER="$CANDIDATE"
+    elif [ -f "$HOME/Projects/leak-guard/plugins/leak-guard/hooks/scanner.py" ]; then
+        SCANNER="$HOME/Projects/leak-guard/plugins/leak-guard/hooks/scanner.py"
     fi
 fi
 
