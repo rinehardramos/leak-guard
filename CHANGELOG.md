@@ -5,6 +5,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **PreToolUse hook inadvertently removed** — A working-tree change intended to simplify hook wiring removed the `PreToolUse` → `hook-pre-tool` registration and stripped it from `settings.json` on the next `install`/`hook-settings` run. The removal comment claimed "proxy on_outbound handles tool-use scanning," but the proxy only scans `role="user"` messages with `type="text"` content blocks; it never inspects `tool_use` content in assistant messages. As a result, secrets written via the `Edit` or `Write` tools (e.g. credentials added directly to config files) bypassed all three scanning layers. The `PreToolUse` hook registration is restored. The scanner's `hook_pre_tool` logic (`_extract_scannable_text` scanning `new_string`/`old_string` for Edit, `content` for Write) was always correct — only the wiring was missing.
+
+---
+
 ## [0.7.0] — 2026-04-12
 
 ### Changed
