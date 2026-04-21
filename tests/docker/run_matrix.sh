@@ -54,6 +54,47 @@ for py in "${PYTHON_VERSIONS[@]}"; do
     done
 done
 
+# ── TUI compatibility tests (opencode + gemini-cli proxy compat) ─────────
+
+TUI_DOCKERFILE="$ROOT/tests/docker/Dockerfile.tui-compat"
+
+build_and_run_tui() {
+    local py="$1"
+    local plat="$2"
+    local arch="${plat##*/}"
+    local tag="leak-guard-tui-compat:py${py}-${arch}"
+    local label="tui-compat python=${py} platform=${plat}"
+
+    echo ""
+    echo "══════════════════════════════════════════"
+    echo "  Matrix: ${label}"
+    echo "══════════════════════════════════════════"
+
+    if ! docker build \
+        --platform "$plat" \
+        --build-arg "PYTHON_VERSION=${py}" \
+        -f "$TUI_DOCKERFILE" \
+        -t "$tag" \
+        "$ROOT" \
+        --quiet 2>/dev/null; then
+        results+=("SKIP  ${label} (build failed — platform not supported)")
+        return
+    fi
+
+    if docker run --rm --platform "$plat" "$tag"; then
+        results+=("PASS  ${label}")
+    else
+        results+=("FAIL  ${label}")
+        failures=$((failures + 1))
+    fi
+}
+
+for py in "${PYTHON_VERSIONS[@]}"; do
+    for plat in "${PLATFORMS[@]}"; do
+        build_and_run_tui "$py" "$plat"
+    done
+done
+
 echo ""
 echo "══════════════════════════════════════════"
 echo "  Matrix Results"

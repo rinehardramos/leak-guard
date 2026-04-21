@@ -1,0 +1,16 @@
+# TUI compatibility test — verifies leak-guard proxy handles
+# opencode (Anthropic API) and gemini-cli (Gemini API) traffic.
+# Uses a mock backend; no real API keys required.
+#
+# Build:  docker build -f tests/docker/Dockerfile.tui-compat -t lg-tui-compat .
+# Run:    docker run --rm lg-tui-compat
+
+ARG PYTHON_VERSION=3.11
+FROM python:${PYTHON_VERSION}-slim
+
+WORKDIR /leak-guard
+
+COPY plugins/ plugins/
+COPY tests/ tests/
+
+CMD ["python3", "tests/docker/tui_compat_test.py"]

@@ -525,3 +525,85 @@ class TestProxyLifecycle:
         px._write_pid(99999)
         px._cleanup_pid()
         assert not (tmp_path / "proxy.pid").exists()
+
+
+class TestGeminiPayloadScan:
+    """Tests for Gemini-format (contents/parts) payload scanning."""
+
+    def _gemini_payload(self, user_text, role="user"):
+        return {
+            "contents": [
+                {"role": role, "parts": [{"text": user_text}]}
+            ],
+            "generationConfig": {"temperature": 0.7},
+        }
+
+    def _multi_turn(self, *texts):
+        contents = []
+        for i, text in enumerate(texts):
+            role = "user" if i % 2 == 0 else "model"
+            contents.append({"role": role, "parts": [{"text": text}]})
+        return {"contents": contents}
+
+    def test_aws_key_redacted_in_gemini_payload(self):
+        key = "AKIA" + "Y3FDSNDK" + "FKSIDJSW"
+        payload = self._gemini_payload(f"my key is {key}")
+        redacted, findings = px.scan_and_redact_gemini_payload(payload, sc.Allowlist())
+        assert key not in json.dumps(redacted)
+        assert len(findings) > 0
+
+    def test_clean_gemini_payload_passes_through(self):
+        payload = self._gemini_payload("Hello, how are you?")
+        redacted, findings = px.scan_and_redact_gemini_payload(payload, sc.Allowlist())
+        assert findings == []
+        assert redacted["contents"][0]["parts"][0]["text"] == "Hello, how are you?"
+
+    def test_multi_turn_user_turns_scanned(self):
+        key = "AKIA" + "Y3FDSNDK" + "FKSIDJSW"
+        payload = self._multi_turn(
+            f"store this key: {key}",
+            "Sure, I stored it.",
+            "Thanks, now use it.",
+        )
+        redacted, findings = px.scan_and_redact_gemini_payload(payload, sc.Allowlist())
+        # User turn 0 had the key — should be redacted
+        assert key not in json.dumps(redacted)
+        assert len(findings) > 0
+        # Model turn should be untouched
+        assert redacted["contents"][1]["parts"][0]["text"] == "Sure, I stored it."
+
+    def test_system_instruction_scanned(self):
+        ssn = "078-05-1120"
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "systemInstruction": {"parts": [{"text": f"SSN is {ssn}"}]},
+        }
+        redacted, findings = px.scan_and_redact_gemini_payload(payload, sc.Allowlist())
+        assert ssn not in json.dumps(redacted)
+        assert len(findings) > 0
+
+    def test_model_turns_not_scanned(self):
+        key = "AKIA" + "Y3FDSNDK" + "FKSIDJSW"
+        payload = self._gemini_payload(key, role="model")
+        redacted, findings = px.scan_and_redact_gemini_payload(payload, sc.Allowlist())
+        # Model messages are not scanned
+        assert findings == []
+        assert redacted["contents"][0]["parts"][0]["text"] == key
+
+    def test_empty_contents_no_crash(self):
+        payload = {"contents": [], "generationConfig": {}}
+        redacted, findings = px.scan_and_redact_gemini_payload(payload, sc.Allowlist())
+        assert findings == []
+
+    def test_non_text_parts_ignored(self):
+        payload = {
+            "contents": [
+                {"role": "user", "parts": [
+                    {"inlineData": {"mimeType": "image/png", "data": "base64..."}},
+                    {"text": "describe this image"},
+                ]}
+            ]
+        }
+        redacted, findings = px.scan_and_redact_gemini_payload(payload, sc.Allowlist())
+        assert findings == []
+        assert redacted["contents"][0]["parts"][1]["text"] == "describe this image"

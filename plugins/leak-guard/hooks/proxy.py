@@ -39,8 +39,14 @@ from scanner import (
 # ──────────────────────────────────────────────────────────────────────────
 
 LISTEN_PORT = int(os.environ.get("LEAK_GUARD_PROXY_PORT", "18019"))
-UPSTREAM_HOST = "api.anthropic.com"
-UPSTREAM_PORT = 443
+UPSTREAM_HOST = os.environ.get("LEAK_GUARD_UPSTREAM_HOST", "api.anthropic.com")
+UPSTREAM_PORT = int(os.environ.get("LEAK_GUARD_UPSTREAM_PORT", "443"))
+UPSTREAM_TLS = os.environ.get("LEAK_GUARD_UPSTREAM_TLS", "true").lower() != "false"
+GEMINI_UPSTREAM_HOST = os.environ.get(
+    "LEAK_GUARD_GEMINI_UPSTREAM_HOST", "generativelanguage.googleapis.com"
+)
+GEMINI_UPSTREAM_PORT = int(os.environ.get("LEAK_GUARD_GEMINI_UPSTREAM_PORT", "443"))
+GEMINI_UPSTREAM_TLS = os.environ.get("LEAK_GUARD_GEMINI_UPSTREAM_TLS", "true").lower() != "false"
 STATE_DIR = _sc.STATE_DIR
 PENDING_FILE = STATE_DIR / "pending.json"
 PID_FILE = STATE_DIR / "proxy.pid"
@@ -243,6 +249,60 @@ def _redact_text(
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Gemini payload scanning
+# ──────────────────────────────────────────────────────────────────────────
+
+def scan_and_redact_gemini_payload(
+    payload: dict[str, Any],
+    allowlist: Allowlist,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Scan Gemini-format payload and redact findings in place.
+
+    Gemini uses:
+        contents[].parts[].text   — user/model conversation turns
+        systemInstruction.parts[].text — system prompt (optional)
+
+    Only scans "user" role turns (or all if role is absent).
+    Returns (modified_payload, findings_list).
+    """
+    import copy
+    payload = copy.deepcopy(payload)
+    all_findings: list[dict[str, Any]] = []
+
+    def _scan_parts(parts: list) -> None:
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            redacted, findings = _redact_text(text, allowlist)
+            if findings:
+                part["text"] = redacted
+                all_findings.extend(findings)
+
+    # Scan conversation turns (contents[])
+    for entry in payload.get("contents", []):
+        if not isinstance(entry, dict):
+            continue
+        role = entry.get("role", "user")
+        if role != "user":
+            continue
+        parts = entry.get("parts", [])
+        if isinstance(parts, list):
+            _scan_parts(parts)
+
+    # Scan system instruction if present
+    sys_inst = payload.get("systemInstruction")
+    if isinstance(sys_inst, dict):
+        parts = sys_inst.get("parts", [])
+        if isinstance(parts, list):
+            _scan_parts(parts)
+
+    return payload, all_findings
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # System note injection
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -413,12 +473,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         is_messages = "/v1/messages" in self.path and "count_tokens" not in self.path
         is_count_tokens = "count_tokens" in self.path
+        is_gemini = "/v1beta/models/" in self.path or "/v1/models/" in self.path
 
         body = raw_body
         payload = None
 
-        # Parse JSON payload for messages/count_tokens endpoints
-        if (is_messages or is_count_tokens) and raw_body:
+        # Parse JSON payload for scannable endpoints
+        if (is_messages or is_count_tokens or is_gemini) and raw_body:
             try:
                 payload = json.loads(raw_body)
             except (json.JSONDecodeError, ValueError):
@@ -460,7 +521,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 # Silent redact — no pending state, no system note
                 payload, _ = scan_and_redact_payload(payload, allowlist)
 
+            elif is_gemini:
+                # Gemini format — silent redact
+                payload, findings = scan_and_redact_gemini_payload(payload, allowlist)
+                if findings:
+                    _requests_redacted += 1
+
             body = json.dumps(payload).encode()
+
+        # Select upstream based on endpoint type
+        if is_gemini:
+            up_host, up_port, up_tls = GEMINI_UPSTREAM_HOST, GEMINI_UPSTREAM_PORT, GEMINI_UPSTREAM_TLS
+        else:
+            up_host, up_port, up_tls = UPSTREAM_HOST, UPSTREAM_PORT, UPSTREAM_TLS
 
         # Build upstream request headers (strip hop-by-hop + force no compression)
         skip_headers = {"host", "transfer-encoding", "content-length", "accept-encoding"}
@@ -468,7 +541,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         for key, val in self.headers.items():
             if key.lower() not in skip_headers:
                 upstream_headers[key] = val
-        upstream_headers["Host"] = UPSTREAM_HOST
+        upstream_headers["Host"] = up_host
         upstream_headers["Content-Length"] = str(len(body))
         upstream_headers["Accept-Encoding"] = "identity"
 
@@ -477,10 +550,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         if payload is not None and isinstance(payload, dict):
             is_stream = bool(payload.get("stream", False))
 
-        # Forward to upstream via HTTPS
+        # Forward to upstream
         try:
-            ctx = ssl.create_default_context()
-            conn = http.client.HTTPSConnection(UPSTREAM_HOST, UPSTREAM_PORT, context=ctx)
+            if up_tls:
+                ctx = ssl.create_default_context()
+                conn = http.client.HTTPSConnection(up_host, up_port, context=ctx)
+            else:
+                conn = http.client.HTTPConnection(up_host, up_port)
             conn.request(method, self.path, body=body, headers=upstream_headers)
             resp = conn.getresponse()
         except Exception:
