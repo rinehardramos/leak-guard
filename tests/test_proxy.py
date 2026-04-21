@@ -516,6 +516,7 @@ class TestProxyLifecycle:
 
     def test_is_proxy_running_false_when_no_pid(self, tmp_path, monkeypatch):
         monkeypatch.setattr(px, "PID_FILE", tmp_path / "proxy.pid")
+        monkeypatch.setattr(px, "LISTEN_PORT", 19999)  # unused port for fallback check
         assert px.is_proxy_running() is False
 
     def test_cleanup_pid(self, tmp_path, monkeypatch):

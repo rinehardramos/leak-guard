@@ -385,11 +385,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def _health(self):
         global _requests_redacted
-        body = json.dumps({
-            "status": "ok",
+        snapshot = {}
+        if hasattr(self.__class__, "resource_monitor") and self.__class__.resource_monitor is not None:
+            snapshot = self.__class__.resource_monitor.snapshot()
+        data = {
+            "status": "ok" if not snapshot.get("warnings") else "warning",
             "allowlist_size": len(_sc.load_allowlist().literal),
             "requests_redacted": _requests_redacted,
-        }).encode()
+        }
+        data.update(snapshot)
+        body = json.dumps(data).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -457,14 +462,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
             body = json.dumps(payload).encode()
 
-        # Build upstream request headers (strip hop-by-hop headers)
-        skip_headers = {"host", "transfer-encoding", "content-length"}
-        upstream_headers = {}
+        # Build upstream request headers (strip hop-by-hop + force no compression)
+        skip_headers = {"host", "transfer-encoding", "content-length", "accept-encoding"}
+        upstream_headers: dict[str, str] = {}
         for key, val in self.headers.items():
             if key.lower() not in skip_headers:
                 upstream_headers[key] = val
         upstream_headers["Host"] = UPSTREAM_HOST
         upstream_headers["Content-Length"] = str(len(body))
+        upstream_headers["Accept-Encoding"] = "identity"
 
         # Determine streaming
         is_stream = False
@@ -492,12 +498,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
             try:
-                while True:
-                    chunk = resp.read(8192)
-                    if not chunk:
-                        break
-                    self.wfile.write(f"{len(chunk):x}\r\n".encode())
-                    self.wfile.write(chunk)
+                for line in iter(resp.readline, b""):
+                    self.wfile.write(f"{len(line):x}\r\n".encode())
+                    self.wfile.write(line)
                     self.wfile.write(b"\r\n")
                     self.wfile.flush()
                 self.wfile.write(b"0\r\n\r\n")
@@ -541,25 +544,47 @@ def _read_pid():
         return None
 
 
-def _cleanup_pid() -> None:
+def _cleanup_pid(expected_pid: int | None = None) -> None:
+    """Remove PID file, but only if it belongs to us.
+
+    If *expected_pid* is given, the file is only deleted when its contents
+    match.  This prevents a crashing child from wiping the PID written by
+    an earlier, healthy instance.
+    """
     try:
+        if expected_pid is not None:
+            current = _read_pid()
+            if current != expected_pid:
+                return  # not ours — leave it alone
         PID_FILE.unlink(missing_ok=True)
     except Exception:
         pass
 
 
+def _port_in_use(port: int) -> bool:
+    """Check if a TCP port is already bound on localhost."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
 def is_proxy_running() -> bool:
     pid = _read_pid()
-    if pid is None:
-        return False
-    try:
-        os.kill(pid, 0)  # signal 0 = check existence
+    if pid is not None:
+        try:
+            os.kill(pid, 0)  # signal 0 = check existence
+            return True
+        except ProcessLookupError:
+            _cleanup_pid()
+        except PermissionError:
+            return True  # exists but can't signal
+
+    # Fallback: PID file missing/stale but port is held by a previous instance
+    if _port_in_use(LISTEN_PORT):
         return True
-    except ProcessLookupError:
-        _cleanup_pid()
-        return False
-    except PermissionError:
-        return True  # exists but can't signal
+
+    return False
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -577,21 +602,93 @@ def _inactivity_watchdog(server) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Startup lock
+# ──────────────────────────────────────────────────────────────────────────
+
+def _acquire_startup_lock() -> "int | None":
+    """Try to acquire an exclusive startup lock via a lockfile.
+
+    Returns the fd on success, None if another process holds it.
+    Uses fcntl.flock which is automatically released on process exit / crash.
+    """
+    import fcntl
+    lock_path = STATE_DIR / "proxy.lock"
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except (OSError, IOError):
+        return None
+
+
+def _should_daemonize(daemon_flag: bool) -> bool:
+    """Under a supervisor, never self-daemonize — supervisor owns the lifecycle."""
+    if os.environ.get("LEAK_GUARD_PROXY_SUPERVISED") == "1":
+        return False
+    return daemon_flag
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Entry point
 # ──────────────────────────────────────────────────────────────────────────
+
+def _cmd_service(action: str) -> None:
+    """Handle 'service install|uninstall|status|restart' subcommands."""
+    from supervisor import get_adapter
+    adapter = get_adapter()
+    proxy_path = Path(__file__).resolve()
+
+    if action == "install":
+        print("[leak-guard] Installing supervisor service...", flush=True)
+        adapter.install(proxy_path)
+        print("[leak-guard] Service installed and started.", flush=True)
+        print(f"  The proxy will auto-start on login and restart on crash.")
+        print(f"  Verify: curl -s http://127.0.0.1:{LISTEN_PORT}/lg-status")
+    elif action == "uninstall":
+        adapter.uninstall()
+        print("[leak-guard] Service removed.", flush=True)
+    elif action == "status":
+        info = adapter.status()
+        print(f"[leak-guard] Supervisor: loaded={info['loaded']} "
+              f"running={info['running']} pid={info.get('pid')} "
+              f"last_exit={info.get('last_exit')}", flush=True)
+    elif action == "restart":
+        if adapter.is_installed():
+            adapter.restart()
+            print("[leak-guard] Restart requested via supervisor.", flush=True)
+        else:
+            print("[leak-guard] No supervisor installed. Use 'service install' first.",
+                  file=sys.stderr, flush=True)
+            sys.exit(1)
+    else:
+        print(f"[leak-guard] Unknown service action: {action}", file=sys.stderr)
+        sys.exit(1)
+
 
 def main():
     import argparse
     parser = argparse.ArgumentParser(prog="leak-guard-proxy")
     parser.add_argument("--daemon", action="store_true")
     parser.add_argument("--port", type=int, default=LISTEN_PORT)
+    sub = parser.add_subparsers(dest="command")
+    svc = sub.add_parser("service", help="Manage OS-level supervisor (launchd/systemd)")
+    svc.add_argument("action", choices=["install", "uninstall", "status", "restart"])
     args = parser.parse_args()
+
+    if args.command == "service":
+        _cmd_service(args.action)
+        return
+
     port = args.port
 
-    if args.daemon:
+    # Dedup guard — silently exit if an instance is already running.
+    if is_proxy_running():
+        sys.exit(0)
+
+    if _should_daemonize(args.daemon):
         pid = os.fork()
         if pid > 0:
-            _write_pid(pid)
             print(f"[proxy] started in background (PID {pid})", flush=True)
             sys.exit(0)
         os.setsid()
@@ -602,22 +699,58 @@ def main():
         log_fd = os.open(str(log_file), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         os.dup2(log_fd, 2)
 
+    # Acquire exclusive startup lock — serialises concurrent launches so only
+    # one child proceeds past this point.
+    lock_fd = _acquire_startup_lock()
+    if lock_fd is None:
+        sys.exit(0)  # another instance is starting or running
+
+    # Re-check after acquiring lock — another instance may have bound the port
+    # while we were racing.
+    if _port_in_use(port):
+        os.close(lock_fd)
+        sys.exit(0)
+
+    # Write PID immediately so concurrent launches see us before server is ready.
+    my_pid = os.getpid()
+    _write_pid(my_pid)
+
+    # Register atexit cleanup with ownership guard
+    import atexit
+    atexit.register(_cleanup_pid, expected_pid=my_pid)
+
+    # Wire resource monitor — recycles process on leak/drift thresholds.
+    from monitor import ResourceMonitor
+    resource_monitor = ResourceMonitor()
+    ProxyHandler.resource_monitor = resource_monitor
+
+    def _on_recycle(breach):
+        print(
+            f"[monitor] recycling: reason={breach.reason} "
+            f"value={breach.value} threshold={breach.threshold}",
+            file=sys.stderr, flush=True,
+        )
+        os._exit(75)
+
+    resource_monitor.start(on_recycle=_on_recycle, interval_s=60.0)
+
     server = ThreadedHTTPServer(("127.0.0.1", port), ProxyHandler)
-    _write_pid(os.getpid())
     print(f"[proxy] listening on http://127.0.0.1:{port}", file=sys.stderr, flush=True)
 
     wd = threading.Thread(target=_inactivity_watchdog, args=(server,), daemon=True)
     wd.start()
 
     def _shutdown(signum, frame):
-        _cleanup_pid()
-        server.shutdown()
+        _cleanup_pid(expected_pid=my_pid)
+        # Call shutdown from a thread — calling it directly in a signal
+        # handler can deadlock if serve_forever() holds an internal lock.
+        threading.Thread(target=server.shutdown, daemon=True).start()
     signal.signal(signal.SIGTERM, _shutdown)
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        _cleanup_pid()
+        _cleanup_pid(expected_pid=my_pid)
         server.shutdown()
 
 
